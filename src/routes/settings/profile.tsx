@@ -14,11 +14,13 @@ function SettingsPage() {
         name?: string;
         email?: string;
         image?: string;
+        profession?: string;
       }>('/api/user/info');
       return {
         name: data.name || '',
         email: data.email || '',
         image: data.image || '',
+        profession: data.profession || '',
       };
     },
   });
@@ -32,7 +34,12 @@ function SettingsPage() {
   }
 
   return (
-    <SettingsForm name={user.name} email={user.email} image={user.image} />
+    <SettingsForm
+      name={user.name}
+      email={user.email}
+      image={user.image}
+      profession={user.profession}
+    />
   );
 }
 

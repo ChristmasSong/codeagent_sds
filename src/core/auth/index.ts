@@ -253,6 +253,12 @@ export function getAuth(configs?: Record<string, string>) {
           required: false,
           defaultValue: '',
         },
+        profession: {
+          type: 'string',
+          input: true,
+          required: false,
+          defaultValue: '',
+        },
       },
     },
     advanced: {

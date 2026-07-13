@@ -5,7 +5,9 @@ import { toast } from 'sonner';
 import { z } from 'zod';
 
 import { m } from '@/core/i18n/messages';
+import { getProfessionLabel } from '@/config/profession-categories';
 import { apiPatch } from '@/lib/api-client';
+import { getLocale } from '@/paraglide/runtime.js';
 import { TextField } from '@/components/form-field';
 import { ImageUploader, ImageUploaderValue } from '@/components/image-uploader';
 import { Button } from '@/components/ui/button';
@@ -31,6 +33,7 @@ export function SettingsForm({
   name: string;
   email: string;
   image: string;
+  profession: string;
 }) {
   const [image, setImage] = useState(initialImage);
   const queryClient = useQueryClient();
@@ -107,6 +110,14 @@ export function SettingsForm({
           <div className="space-y-2">
             <Label htmlFor="email">{m['settings.profile.email']()}</Label>
             <Input id="email" value={email} disabled className="opacity-60" />
+          </div>
+          <div className="space-y-2">
+            <Label>{m['settings.profile.profession']()}</Label>
+            <Input
+              value={getProfessionLabel(profession, getLocale())}
+              disabled
+              className="opacity-60"
+            />
           </div>
         </CardContent>
         <CardFooter>

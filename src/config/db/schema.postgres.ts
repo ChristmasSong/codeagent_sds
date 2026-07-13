@@ -36,10 +36,12 @@ export const user = table(
     utmSource: text('utm_source').notNull().default(''),
     ip: text('ip').notNull().default(''),
     locale: text('locale').notNull().default(''),
+    profession: text('profession').notNull().default(''),
   },
   (table) => [
     index('idx_user_name').on(table.name),
     index('idx_user_created_at').on(table.createdAt),
+    index('idx_user_profession').on(table.profession),
   ]
 );
 

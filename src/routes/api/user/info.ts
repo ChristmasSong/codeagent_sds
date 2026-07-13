@@ -32,6 +32,7 @@ async function GET({ request }: { request: Request }) {
       name: session.user.name,
       email: session.user.email,
       image: session.user.image,
+      profession: (session.user as any).profession || '',
       plan,
       trialEndsAt: trialEndsAt?.toISOString() || null,
       authorized: plan === 'trial' || plan === 'member',

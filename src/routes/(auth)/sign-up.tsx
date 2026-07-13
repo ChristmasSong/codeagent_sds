@@ -7,8 +7,12 @@ import { authClient, signIn, signUp, useSession } from '@/core/auth/client';
 import { m } from '@/core/i18n/messages';
 import { Link, useRouter } from '@/core/i18n/navigation';
 import { envConfigs } from '@/config';
+import {
+  getProfessionLabel,
+  professionCategories,
+} from '@/config/profession-categories';
 import { apiPost } from '@/lib/api-client';
-import { localizeHref } from '@/paraglide/runtime.js';
+import { getLocale, localizeHref } from '@/paraglide/runtime.js';
 import { usePublicConfig } from '@/hooks/use-public-config';
 import { TextField } from '@/components/form-field';
 import { Button } from '@/components/ui/button';
@@ -19,6 +23,16 @@ import {
   FieldGroup,
   FieldSeparator,
 } from '@/components/ui/field';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 
 const signUpSchema = z
   .object({
@@ -27,6 +41,7 @@ const signUpSchema = z
     password: z.string().min(8),
     confirmPassword: z.string().min(8),
     inviteCode: z.string(),
+    profession: z.string().min(1, m['common.sign.profession_required']()),
   })
   .refine((d) => d.password === d.confirmPassword, {
     path: ['confirmPassword'],
@@ -101,6 +116,7 @@ function SignUpPage() {
       password: '',
       confirmPassword: '',
       inviteCode: '',
+      profession: '',
     },
     validators: { onSubmit: signUpSchema },
     onSubmit: async ({ value }) => {
@@ -127,6 +143,7 @@ function SignUpPage() {
           name: value.name,
           email: value.email,
           password: value.password,
+          profession: value.profession,
         });
         if (result.error) {
           setError(result.error.message || 'Sign up failed');
@@ -277,6 +294,57 @@ function SignUpPage() {
                             placeholder={m['common.sign.name_placeholder']()}
                           />
                         )}
+                      </form.Field>
+                      <form.Field name="profession">
+                        {(field) => {
+                          const locale = getLocale();
+                          const currentValue = field.state.value;
+                          const selectedLabel = currentValue
+                            ? getProfessionLabel(currentValue, locale)
+                            : undefined;
+                          return (
+                            <div className="space-y-2">
+                              <Label>
+                                {m['common.sign.profession_title']()}
+                              </Label>
+                              <Select
+                                value={currentValue || undefined}
+                                onValueChange={(v) => field.handleChange(v)}
+                              >
+                                <SelectTrigger className="w-full">
+                                  <SelectValue
+                                    placeholder={m[
+                                      'common.sign.profession_placeholder'
+                                    ]()}
+                                  >
+                                    {selectedLabel}
+                                  </SelectValue>
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {professionCategories.map((cat) => (
+                                    <SelectGroup key={cat.value}>
+                                      <SelectLabel>
+                                        {locale === 'zh'
+                                          ? cat.label.zh
+                                          : cat.label.en}
+                                      </SelectLabel>
+                                      {cat.children?.map((sub) => (
+                                        <SelectItem
+                                          key={sub.value}
+                                          value={sub.value}
+                                        >
+                                          {locale === 'zh'
+                                            ? sub.label.zh
+                                            : sub.label.en}
+                                        </SelectItem>
+                                      ))}
+                                    </SelectGroup>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            </div>
+                          );
+                        }}
                       </form.Field>
                       <form.Field name="email">
                         {(field) => (

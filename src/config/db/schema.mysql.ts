@@ -37,10 +37,12 @@ export const user = table(
     utmSource: varchar('utm_source', { length: 100 }).notNull().default(''),
     ip: varchar('ip', { length: 45 }).notNull().default(''),
     locale: varchar('locale', { length: 20 }).notNull().default(''),
+    profession: varchar('profession', { length: 80 }).notNull().default(''),
   },
   (table) => [
     index('idx_user_name').on(table.name),
     index('idx_user_created_at').on(table.createdAt),
+    index('idx_user_profession').on(table.profession),
   ]
 );
 
