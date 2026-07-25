@@ -28,6 +28,7 @@ export const envConfigs: Record<string, string> = {
   code_max_active_sessions: procEnv.CODE_MAX_ACTIVE_SESSIONS ?? '1',
   code_session_idle_suspend_minutes:
     procEnv.CODE_SESSION_IDLE_SUSPEND_MINUTES ?? '30',
+  billing_usage_webhook_secret: procEnv.BILLING_USAGE_WEBHOOK_SECRET ?? '',
 
   // Database
   database_url: procEnv.DATABASE_URL ?? '',

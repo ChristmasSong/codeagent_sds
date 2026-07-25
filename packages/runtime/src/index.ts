@@ -1339,6 +1339,40 @@ export default {
       }
     }
 
+    const filesMatch = url.pathname.match(
+      /^\/files\/([^/]+)\/([^/]+)(?:\/(status|content))?$/
+    );
+    if (filesMatch) {
+      if (
+        !env.BILLING_USAGE_WEBHOOK_SECRET ||
+        request.headers.get('x-hicode-runtime-secret') !==
+          env.BILLING_USAGE_WEBHOOK_SECRET
+      ) {
+        return json({ ok: false, error: 'unauthorized' }, { status: 401 });
+      }
+      if (request.method !== 'GET') {
+        return json(
+          { ok: false, error: 'method_not_allowed' },
+          { status: 405 }
+        );
+      }
+
+      const userId = decodeURIComponent(filesMatch[1]);
+      const sessionId = decodeURIComponent(filesMatch[2]);
+      const operation = filesMatch[3] || '';
+      const target = new URL(request.url);
+      target.pathname = `/files/${encodeURIComponent(sessionId)}${operation ? `/${operation}` : ''}`;
+      const headers = new Headers();
+      headers.set('x-codeagent-user', userId);
+      headers.set('x-codeagent-session', sessionId);
+      return container(env, userId).fetch(
+        new Request(target, {
+          method: 'GET',
+          headers,
+        })
+      );
+    }
+
     const terminalMatch = url.pathname.match(/^\/terminal\/([^/]+)\/([^/]+)$/);
     if (terminalMatch) {
       const userId = decodeURIComponent(terminalMatch[1]);
