@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { createFileRoute, redirect } from '@tanstack/react-router';
 import { createServerFn } from '@tanstack/react-start';
@@ -14,14 +22,10 @@ import {
   Focus,
   FolderTree,
   History,
-  PanelLeftClose,
-  PanelLeftOpen,
   Play,
   Plus,
   Square,
   Terminal,
-  X,
-  type LucideIcon,
 } from 'lucide-react';
 
 import '@xterm/xterm/css/xterm.css';
@@ -109,6 +113,24 @@ type ArchiveCheckpointState =
   | 'verified'
   | 'error';
 
+type WorkbenchPane = 'sessions' | 'terminal' | 'workspace';
+type WorkspaceTab = 'files' | 'preview' | 'archive';
+
+const WORKSPACE_TABS: WorkspaceTab[] = ['files', 'preview', 'archive'];
+const MIN_WORKSPACE_WIDTH = 360;
+const MAX_WORKSPACE_WIDTH = 640;
+const MIN_FILE_TREE_PERCENT = 22;
+const MAX_FILE_TREE_PERCENT = 62;
+
+function workspaceWidthLimit(workbench: HTMLDivElement | null) {
+  if (!workbench) return MAX_WORKSPACE_WIDTH;
+  const availableWidth = workbench.getBoundingClientRect().width - 240 - 420;
+  return Math.min(
+    MAX_WORKSPACE_WIDTH,
+    Math.max(MIN_WORKSPACE_WIDTH, availableWidth)
+  );
+}
+
 interface ArchiveCheckpoint {
   sessionId: string | null;
   state: ArchiveCheckpointState;
@@ -125,8 +147,6 @@ interface CodeLoaderData {
   models: CodeModelView[];
   runtimeBase: string;
 }
-
-const CODE_SIDEBAR_COLLAPSED_KEY = 'hicode:code-sidebar-collapsed';
 
 function CodeWorkspacePage() {
   const loader = Route.useLoaderData() as CodeLoaderData;
@@ -161,9 +181,31 @@ function CodeWorkspacePage() {
   const [runtimeIssue, setRuntimeIssue] = useState<string>('');
   const [busyAction, setBusyAction] = useState<string>('');
   const [previewNonce, setPreviewNonce] = useState(0);
+  const [activeWorkbenchPane, setActiveWorkbenchPane] =
+    useState<WorkbenchPane>('terminal');
+  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('files');
+  const [workspaceWidth, setWorkspaceWidth] = useState(440);
+  const [fileTreePercent, setFileTreePercent] = useState(34);
   const [selectedFile, setSelectedFile] = useState<WorkspaceFileEntry | null>(
     null
   );
+  const workbenchRef = useRef<HTMLDivElement | null>(null);
+  const workspaceFilesRef = useRef<HTMLDivElement | null>(null);
+  const workspaceResizeRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startWidth: number;
+    previousCursor: string;
+    previousUserSelect: string;
+  } | null>(null);
+  const fileTreeResizeRef = useRef<{
+    pointerId: number;
+    startY: number;
+    startPercent: number;
+    containerHeight: number;
+    previousCursor: string;
+    previousUserSelect: string;
+  } | null>(null);
   const [restoredSessionIds, setRestoredSessionIds] = useState<
     Record<string, true>
   >({});
@@ -178,8 +220,6 @@ function CodeWorkspacePage() {
   const [terminalElement, setTerminalElement] = useState<HTMLDivElement | null>(
     null
   );
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   const currentSession =
     sessions.find((session) => session.id === sessionId) ??
@@ -326,7 +366,6 @@ function CodeWorkspacePage() {
     focused,
     mode,
     reconnect,
-    resize: resizeTerminal,
     focus: focusTerminal,
     interrupt,
     scrollToBottom,
@@ -349,20 +388,27 @@ function CodeWorkspacePage() {
   );
 
   useEffect(() => {
-    setSidebarCollapsed(
-      window.localStorage.getItem(CODE_SIDEBAR_COLLAPSED_KEY) === 'true'
-    );
-  }, []);
-
-  useEffect(() => {
-    const timer = window.setTimeout(resizeTerminal, 220);
-    return () => window.clearTimeout(timer);
-  }, [mobileSidebarOpen, resizeTerminal, sidebarCollapsed]);
-
-  useEffect(() => {
     setRuntimeIssue('');
     setSelectedFile(null);
   }, [sessionId]);
+
+  useEffect(
+    () => () => {
+      const fileTreeResize = fileTreeResizeRef.current;
+      const workspaceResize = workspaceResizeRef.current;
+      if (fileTreeResize) {
+        document.body.style.cursor = fileTreeResize.previousCursor;
+        document.body.style.userSelect = fileTreeResize.previousUserSelect;
+      }
+      if (workspaceResize) {
+        document.body.style.cursor = workspaceResize.previousCursor;
+        document.body.style.userSelect = workspaceResize.previousUserSelect;
+      }
+      fileTreeResizeRef.current = null;
+      workspaceResizeRef.current = null;
+    },
+    []
+  );
 
   useEffect(() => {
     setArchiveCheckpoint((prev) => {
@@ -548,8 +594,8 @@ function CodeWorkspacePage() {
       markSessionRestoreReady(session.id);
       setSelectedAgent(session.agent);
       setSelectedModel(session.model);
-      setMobileSidebarOpen(false);
       setPreviewNonce(Date.now());
+      setActiveWorkbenchPane('terminal');
       const message = `${m['code.actions.started']()}: ${shortId(session.id)}`;
       setNewSessionMsg(
         cleanupErrors.length
@@ -637,9 +683,9 @@ function CodeWorkspacePage() {
       setArchiveCheckpoint(checkpointFromSession(session));
       setSelectedAgent(session.agent);
       setSelectedModel(session.model);
-      setMobileSidebarOpen(false);
       setRuntimeIssue('');
       setPreviewNonce(Date.now());
+      setActiveWorkbenchPane('terminal');
       setNewSessionMsg(
         `${m['code.actions.restoring']()}: ${shortId(session.id)}`
       );
@@ -736,18 +782,158 @@ function CodeWorkspacePage() {
     }
   };
 
-  const toggleSidebar = () => {
-    setSidebarCollapsed((collapsed) => {
-      const next = !collapsed;
-      window.localStorage.setItem(CODE_SIDEBAR_COLLAPSED_KEY, String(next));
-      return next;
+  const beginWorkspaceResize = (
+    event: ReactPointerEvent<HTMLButtonElement>
+  ) => {
+    if (!window.matchMedia('(min-width: 1280px)').matches) return;
+    if (workspaceResizeRef.current || fileTreeResizeRef.current) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    workspaceResizeRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth:
+        event.currentTarget.parentElement?.getBoundingClientRect().width ??
+        workspaceWidth,
+      previousCursor: document.body.style.cursor,
+      previousUserSelect: document.body.style.userSelect,
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  };
+
+  const resizeWorkspace = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const resize = workspaceResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    const nextWidth = resize.startWidth + (resize.startX - event.clientX);
+    const maxWidth = workspaceWidthLimit(workbenchRef.current);
+    setWorkspaceWidth(
+      Math.min(maxWidth, Math.max(MIN_WORKSPACE_WIDTH, nextWidth))
+    );
+  };
+
+  const finishWorkspaceResize = (
+    event: ReactPointerEvent<HTMLButtonElement>
+  ) => {
+    const resize = workspaceResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    document.body.style.cursor = resize.previousCursor;
+    document.body.style.userSelect = resize.previousUserSelect;
+    workspaceResizeRef.current = null;
+  };
+
+  const resizeWorkspaceWithKeyboard = (
+    event: ReactKeyboardEvent<HTMLButtonElement>
+  ) => {
+    let nextWidth = workspaceWidth;
+    if (event.key === 'ArrowLeft') nextWidth += 24;
+    else if (event.key === 'ArrowRight') nextWidth -= 24;
+    else if (event.key === 'Home') nextWidth = MIN_WORKSPACE_WIDTH;
+    else if (event.key === 'End')
+      nextWidth = workspaceWidthLimit(workbenchRef.current);
+    else return;
+    event.preventDefault();
+    const maxWidth = workspaceWidthLimit(workbenchRef.current);
+    setWorkspaceWidth(
+      Math.min(maxWidth, Math.max(MIN_WORKSPACE_WIDTH, nextWidth))
+    );
+  };
+
+  const beginFileTreeResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (workspaceResizeRef.current || fileTreeResizeRef.current) return;
+    const containerHeight =
+      workspaceFilesRef.current?.getBoundingClientRect().height ?? 0;
+    if (containerHeight <= 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    fileTreeResizeRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startPercent: fileTreePercent,
+      containerHeight,
+      previousCursor: document.body.style.cursor,
+      previousUserSelect: document.body.style.userSelect,
+    };
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+  };
+
+  const resizeFileTree = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const resize = fileTreeResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    const deltaPercent =
+      ((event.clientY - resize.startY) / resize.containerHeight) * 100;
+    setFileTreePercent(
+      Math.min(
+        MAX_FILE_TREE_PERCENT,
+        Math.max(MIN_FILE_TREE_PERCENT, resize.startPercent + deltaPercent)
+      )
+    );
+  };
+
+  const finishFileTreeResize = (
+    event: ReactPointerEvent<HTMLButtonElement>
+  ) => {
+    const resize = fileTreeResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    document.body.style.cursor = resize.previousCursor;
+    document.body.style.userSelect = resize.previousUserSelect;
+    fileTreeResizeRef.current = null;
+  };
+
+  const resizeFileTreeWithKeyboard = (
+    event: ReactKeyboardEvent<HTMLButtonElement>
+  ) => {
+    let nextPercent = fileTreePercent;
+    if (event.key === 'ArrowUp') nextPercent -= 4;
+    else if (event.key === 'ArrowDown') nextPercent += 4;
+    else if (event.key === 'Home') nextPercent = MIN_FILE_TREE_PERCENT;
+    else if (event.key === 'End') nextPercent = MAX_FILE_TREE_PERCENT;
+    else return;
+    event.preventDefault();
+    setFileTreePercent(
+      Math.min(
+        MAX_FILE_TREE_PERCENT,
+        Math.max(MIN_FILE_TREE_PERCENT, nextPercent)
+      )
+    );
+  };
+
+  const moveWorkspaceTabWithKeyboard = (
+    event: ReactKeyboardEvent<HTMLDivElement>
+  ) => {
+    const currentIndex = WORKSPACE_TABS.indexOf(workspaceTab);
+    let nextIndex = currentIndex;
+    if (event.key === 'ArrowRight') {
+      nextIndex = (currentIndex + 1) % WORKSPACE_TABS.length;
+    } else if (event.key === 'ArrowLeft') {
+      nextIndex =
+        (currentIndex - 1 + WORKSPACE_TABS.length) % WORKSPACE_TABS.length;
+    } else if (event.key === 'Home') {
+      nextIndex = 0;
+    } else if (event.key === 'End') {
+      nextIndex = WORKSPACE_TABS.length - 1;
+    } else {
+      return;
+    }
+    event.preventDefault();
+    const nextTab = WORKSPACE_TABS[nextIndex]!;
+    setWorkspaceTab(nextTab);
+    window.requestAnimationFrame(() => {
+      document.getElementById(`code-workspace-tab-${nextTab}`)?.focus();
     });
   };
 
   return (
-    <div className="bg-background text-foreground min-h-screen">
-      <header className="border-border bg-background/90 sticky top-0 z-40 border-b backdrop-blur">
-        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6">
+    <div className="bg-background text-foreground flex h-dvh min-h-0 flex-col overflow-hidden">
+      <header className="border-border bg-background/90 z-40 shrink-0 border-b backdrop-blur">
+        <div className="mx-auto flex h-16 w-full max-w-[1920px] items-center justify-between px-4 sm:px-6">
           <Link href="/" className="flex items-center gap-2.5">
             <img
               src={envConfigs.app_logo}
@@ -796,74 +982,72 @@ function CodeWorkspacePage() {
         </div>
       </header>
 
-      {mobileSidebarOpen && (
-        <button
-          type="button"
-          className="fixed inset-0 top-16 z-40 bg-black/35 lg:hidden"
-          aria-label={m['code.sidebar.close']()}
-          onClick={() => setMobileSidebarOpen(false)}
-        />
-      )}
-
-      <main
-        className={cn(
-          'mx-auto grid max-w-[1600px] gap-4 px-4 py-4 transition-[grid-template-columns] duration-200 sm:px-6',
-          sidebarCollapsed
-            ? 'lg:grid-cols-[56px_minmax(0,1fr)]'
-            : 'lg:grid-cols-[260px_minmax(0,1fr)]'
-        )}
-      >
-        <aside
-          className={cn(
-            'border-border bg-card fixed top-20 bottom-4 left-4 z-50 max-h-[calc(100vh-6rem)] w-[min(320px,calc(100vw-2rem))] overflow-y-auto rounded-lg border p-4 shadow-xl transition-[width,padding] duration-200 lg:static lg:z-auto lg:block lg:max-h-none lg:min-h-[calc(100vh-6rem)] lg:w-auto lg:overflow-visible lg:shadow-none',
-            mobileSidebarOpen ? 'block' : 'hidden lg:block',
-            sidebarCollapsed && 'lg:p-2'
-          )}
+      <main className="mx-auto flex min-h-0 w-full max-w-[1920px] flex-1 flex-col gap-2 overflow-hidden p-2 sm:p-3">
+        <nav
+          className="border-border bg-card flex shrink-0 gap-1 overflow-x-auto rounded-lg border p-1 xl:hidden"
+          aria-label={m['code.terminal.title']()}
         >
-          <div
+          <Button
+            type="button"
+            size="sm"
+            variant={activeWorkbenchPane === 'sessions' ? 'secondary' : 'ghost'}
+            className="h-8 min-w-max flex-1 rounded-md text-xs"
+            aria-pressed={activeWorkbenchPane === 'sessions'}
+            onClick={() => setActiveWorkbenchPane('sessions')}
+          >
+            <History className="size-3.5" />
+            {m['code.sessions.title']()}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={activeWorkbenchPane === 'terminal' ? 'secondary' : 'ghost'}
+            className="h-8 min-w-max flex-1 rounded-md text-xs"
+            aria-pressed={activeWorkbenchPane === 'terminal'}
+            onClick={() => setActiveWorkbenchPane('terminal')}
+          >
+            <Terminal className="size-3.5" />
+            {m['code.terminal.title']()}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={
+              activeWorkbenchPane === 'workspace' ? 'secondary' : 'ghost'
+            }
+            className="h-8 min-w-max flex-1 rounded-md text-xs"
+            aria-pressed={activeWorkbenchPane === 'workspace'}
+            onClick={() => setActiveWorkbenchPane('workspace')}
+          >
+            <FolderTree className="size-3.5" />
+            {m['code.files.title']()}
+          </Button>
+        </nav>
+
+        <div
+          ref={workbenchRef}
+          className="border-border bg-card grid min-h-0 flex-1 grid-cols-1 overflow-hidden rounded-lg border xl:grid-cols-[240px_minmax(420px,1fr)_var(--workspace-width)]"
+          style={
+            {
+              '--workspace-width': `min(${workspaceWidth}px, calc(100% - 660px))`,
+            } as CSSProperties
+          }
+        >
+          <aside
             className={cn(
-              'flex items-center justify-between',
-              sidebarCollapsed && 'lg:flex-col lg:gap-3'
+              'border-border bg-card min-h-0 flex-col overflow-y-auto p-4 xl:flex xl:border-r',
+              activeWorkbenchPane === 'sessions' ? 'flex' : 'hidden'
             )}
           >
-            <div className={cn(sidebarCollapsed && 'lg:hidden')}>
-              <p className="text-sm font-semibold">
-                {m['code.sessions.title']()}
-              </p>
-              <p className="text-muted-foreground mt-1 text-xs">
-                {m['code.sessions.subtitle']()}
-              </p>
-            </div>
-            <div
-              className={cn(
-                'flex items-center gap-2',
-                sidebarCollapsed && 'lg:flex-col'
-              )}
-            >
-              <Button
-                type="button"
-                size="icon"
-                variant="ghost"
-                className="hidden size-8 lg:inline-flex"
-                aria-label={
-                  sidebarCollapsed
-                    ? m['code.sidebar.expand']()
-                    : m['code.sidebar.collapse']()
-                }
-                title={
-                  sidebarCollapsed
-                    ? m['code.sidebar.expand']()
-                    : m['code.sidebar.collapse']()
-                }
-                aria-expanded={!sidebarCollapsed}
-                onClick={toggleSidebar}
-              >
-                {sidebarCollapsed ? (
-                  <PanelLeftOpen className="size-4" />
-                ) : (
-                  <PanelLeftClose className="size-4" />
-                )}
-              </Button>
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-semibold">
+                  {m['code.sessions.title']()}
+                </p>
+                <p className="text-muted-foreground mt-1 text-xs">
+                  {m['code.sessions.subtitle']()}
+                </p>
+              </div>
               <Button
                 size="icon"
                 className="size-8 rounded-full"
@@ -875,610 +1059,727 @@ function CodeWorkspacePage() {
               >
                 <Plus className="size-4" />
               </Button>
-              <Button
-                type="button"
-                size="icon"
-                variant="ghost"
-                className="size-8 lg:hidden"
-                aria-label={m['code.sidebar.close']()}
-                title={m['code.sidebar.close']()}
-                onClick={() => setMobileSidebarOpen(false)}
-              >
-                <X className="size-4" />
-              </Button>
             </div>
-          </div>
 
-          <div
-            className={cn('mt-5 space-y-2', sidebarCollapsed && 'lg:hidden')}
-          >
-            <Label className="text-muted-foreground text-xs">
-              {m['code.agent.new_session']()}
-            </Label>
-            <Select
-              value={selectedAgent}
-              onValueChange={(value) => {
-                const agent = normalizeAgent(value);
-                setSelectedAgent(agent);
-                setSelectedModel(defaultModelFor(models, agent)?.model || '');
-              }}
-              disabled={Boolean(busyAction)}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent align="start">
-                {CODE_SESSION_AGENTS.map((agent) => (
-                  <SelectItem key={agent} value={agent}>
-                    {agentLabel(agent)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div
-            className={cn('mt-4 space-y-2', sidebarCollapsed && 'lg:hidden')}
-          >
-            <Label className="text-muted-foreground text-xs">
-              {m['code.model.new_session']()}
-            </Label>
-            <Select
-              value={selectedModel}
-              onValueChange={(value) => value && setSelectedModel(value)}
-              disabled={Boolean(busyAction) || availableModels.length === 0}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder={m['code.model.select']()} />
-              </SelectTrigger>
-              <SelectContent align="start">
-                {availableModels.map((model) => (
-                  <SelectItem key={model.id} value={model.model}>
-                    {model.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {availableModels.length === 0 && (
-              <p className="text-muted-foreground text-xs">
-                {m['code.model.configure_required']()}
-              </p>
-            )}
-          </div>
-
-          {newSessionMsg && (
-            <p
-              aria-live="polite"
-              className={cn(
-                'text-muted-foreground mt-3 rounded-md border border-dashed px-3 py-2 text-xs leading-5',
-                sidebarCollapsed && 'lg:hidden'
-              )}
-            >
-              {newSessionMsg}
-            </p>
-          )}
-
-          {newSessionIssue && (
-            <div
-              role="alert"
-              className={cn(
-                'border-destructive/40 bg-destructive/5 mt-3 rounded-md border px-3 py-3 text-xs leading-5',
-                sidebarCollapsed && 'lg:hidden'
-              )}
-            >
-              <div className="text-destructive flex items-start gap-2 font-medium">
-                <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-                <span>
-                  {newSessionIssue.reason === 'insufficient_credits'
-                    ? m['code.billing.insufficient_title']()
-                    : m['code.billing.model_unavailable_title']()}
-                </span>
-              </div>
-              <p className="text-muted-foreground mt-1.5">
-                {newSessionIssue.reason === 'insufficient_credits'
-                  ? m['code.billing.insufficient_description']({
-                      balance: newSessionIssue.balance ?? 0,
-                      required: newSessionIssue.requiredBalance ?? 0,
-                    })
-                  : m['code.billing.model_unavailable_description']()}
-              </p>
-              {newSessionIssue.reason === 'insufficient_credits' && (
-                <Link
-                  href="/settings/top-up"
-                  className="text-primary mt-2 inline-flex font-medium hover:underline"
-                >
-                  {m['code.billing.manage_credits']()}
-                </Link>
-              )}
-            </div>
-          )}
-
-          <div
-            className={cn('mt-6 space-y-2', sidebarCollapsed && 'lg:hidden')}
-          >
-            {sessions.length === 0 && (
-              <p className="text-muted-foreground rounded-md border border-dashed px-3 py-2 text-xs">
-                {m['code.sessions.empty']()}
-              </p>
-            )}
-            {sessions.map((session) => (
-              <button
-                key={session.id}
-                type="button"
-                className={cn(
-                  'flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-sm transition-colors',
-                  session.id === sessionId ? 'bg-muted' : 'hover:bg-muted/70'
-                )}
-                onClick={() => {
-                  setSessionId(session.id);
-                  setSelectedAgent(session.agent);
-                  setSelectedModel(session.model);
-                  setMobileSidebarOpen(false);
+            <div className="mt-5 space-y-2">
+              <Label className="text-muted-foreground text-xs">
+                {m['code.agent.new_session']()}
+              </Label>
+              <Select
+                value={selectedAgent}
+                onValueChange={(value) => {
+                  const agent = normalizeAgent(value);
+                  setSelectedAgent(agent);
+                  setSelectedModel(defaultModelFor(models, agent)?.model || '');
                 }}
+                disabled={Boolean(busyAction)}
               >
-                <span
-                  className={cn(
-                    'size-2 rounded-full',
-                    session.id === sessionId
-                      ? 'bg-primary'
-                      : 'bg-muted-foreground'
-                  )}
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate font-mono text-xs">
-                    {session.id}
-                  </span>
-                  <span className="text-muted-foreground mt-0.5 flex items-center gap-1 text-[11px]">
-                    <Bot className="size-3" />
-                    {agentLabel(session.agent)}
-                  </span>
-                  <span className="text-muted-foreground mt-0.5 block truncate text-[11px]">
-                    {modelLabel(models, session)}
-                  </span>
-                </span>
-              </button>
-            ))}
-          </div>
-
-          <div
-            className={cn(
-              'border-border mt-6 border-t pt-5',
-              sidebarCollapsed && 'lg:hidden'
-            )}
-          >
-            <div className="mb-3 flex items-center gap-2 text-xs font-medium">
-              <History className="text-muted-foreground size-3.5" />
-              {m['code.sessions.archived_title']()}
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent align="start">
+                  {CODE_SESSION_AGENTS.map((agent) => (
+                    <SelectItem key={agent} value={agent}>
+                      {agentLabel(agent)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
-            <div className="space-y-2">
-              {archivedSessions.length === 0 && (
-                <p className="text-muted-foreground rounded-md border border-dashed px-3 py-2 text-xs">
-                  {m['code.sessions.archived_empty']()}
+
+            <div className="mt-4 space-y-2">
+              <Label className="text-muted-foreground text-xs">
+                {m['code.model.new_session']()}
+              </Label>
+              <Select
+                value={selectedModel}
+                onValueChange={(value) => value && setSelectedModel(value)}
+                disabled={Boolean(busyAction) || availableModels.length === 0}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder={m['code.model.select']()} />
+                </SelectTrigger>
+                <SelectContent align="start">
+                  {availableModels.map((model) => (
+                    <SelectItem key={model.id} value={model.model}>
+                      {model.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {availableModels.length === 0 && (
+                <p className="text-muted-foreground text-xs">
+                  {m['code.model.configure_required']()}
                 </p>
               )}
-              {archivedSessions.map((session) => (
+            </div>
+
+            {newSessionMsg && (
+              <p
+                aria-live="polite"
+                className="text-muted-foreground mt-3 rounded-md border border-dashed px-3 py-2 text-xs leading-5"
+              >
+                {newSessionMsg}
+              </p>
+            )}
+
+            {newSessionIssue && (
+              <div
+                role="alert"
+                className="border-destructive/40 bg-destructive/5 mt-3 rounded-md border px-3 py-3 text-xs leading-5"
+              >
+                <div className="text-destructive flex items-start gap-2 font-medium">
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                  <span>
+                    {newSessionIssue.reason === 'insufficient_credits'
+                      ? m['code.billing.insufficient_title']()
+                      : m['code.billing.model_unavailable_title']()}
+                  </span>
+                </div>
+                <p className="text-muted-foreground mt-1.5">
+                  {newSessionIssue.reason === 'insufficient_credits'
+                    ? m['code.billing.insufficient_description']({
+                        balance: newSessionIssue.balance ?? 0,
+                        required: newSessionIssue.requiredBalance ?? 0,
+                      })
+                    : m['code.billing.model_unavailable_description']()}
+                </p>
+                {newSessionIssue.reason === 'insufficient_credits' && (
+                  <Link
+                    href="/settings/top-up"
+                    className="text-primary mt-2 inline-flex font-medium hover:underline"
+                  >
+                    {m['code.billing.manage_credits']()}
+                  </Link>
+                )}
+              </div>
+            )}
+
+            <div className="mt-6 space-y-2">
+              {sessions.length === 0 && (
+                <p className="text-muted-foreground rounded-md border border-dashed px-3 py-2 text-xs">
+                  {m['code.sessions.empty']()}
+                </p>
+              )}
+              {sessions.map((session) => (
                 <button
                   key={session.id}
                   type="button"
-                  className="hover:bg-muted/70 flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60"
-                  disabled={Boolean(busyAction) || restoreInProgress}
-                  onClick={() => requestRestoreArchivedSession(session)}
+                  className={cn(
+                    'flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-sm transition-colors',
+                    session.id === sessionId ? 'bg-muted' : 'hover:bg-muted/70'
+                  )}
+                  onClick={() => {
+                    setSessionId(session.id);
+                    setSelectedAgent(session.agent);
+                    setSelectedModel(session.model);
+                    setActiveWorkbenchPane('terminal');
+                  }}
                 >
-                  <span className="border-muted-foreground/40 size-2 rounded-full border" />
+                  <span
+                    className={cn(
+                      'size-2 rounded-full',
+                      session.id === sessionId
+                        ? 'bg-primary'
+                        : 'bg-muted-foreground'
+                    )}
+                  />
                   <span className="min-w-0 flex-1">
                     <span className="block truncate font-mono text-xs">
                       {session.id}
                     </span>
                     <span className="text-muted-foreground mt-0.5 flex items-center gap-1 text-[11px]">
-                      <Archive className="size-3" />
-                      {sessionStatusLabel(session.status)} ·{' '}
+                      <Bot className="size-3" />
                       {agentLabel(session.agent)}
                     </span>
                     <span className="text-muted-foreground mt-0.5 block truncate text-[11px]">
                       {modelLabel(models, session)}
                     </span>
                   </span>
-                  <span className="text-primary shrink-0 text-[11px] font-medium">
-                    {m['code.sessions.restore']()}
-                  </span>
                 </button>
               ))}
             </div>
-          </div>
 
-          <div
+            <div className="border-border mt-6 border-t pt-5">
+              <div className="mb-3 flex items-center gap-2 text-xs font-medium">
+                <History className="text-muted-foreground size-3.5" />
+                {m['code.sessions.archived_title']()}
+              </div>
+              <div className="space-y-2">
+                {archivedSessions.length === 0 && (
+                  <p className="text-muted-foreground rounded-md border border-dashed px-3 py-2 text-xs">
+                    {m['code.sessions.archived_empty']()}
+                  </p>
+                )}
+                {archivedSessions.map((session) => (
+                  <button
+                    key={session.id}
+                    type="button"
+                    className="hover:bg-muted/70 flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                    disabled={Boolean(busyAction) || restoreInProgress}
+                    onClick={() => requestRestoreArchivedSession(session)}
+                  >
+                    <span className="border-muted-foreground/40 size-2 rounded-full border" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-mono text-xs">
+                        {session.id}
+                      </span>
+                      <span className="text-muted-foreground mt-0.5 flex items-center gap-1 text-[11px]">
+                        <Archive className="size-3" />
+                        {sessionStatusLabel(session.status)} ·{' '}
+                        {agentLabel(session.agent)}
+                      </span>
+                      <span className="text-muted-foreground mt-0.5 block truncate text-[11px]">
+                        {modelLabel(models, session)}
+                      </span>
+                    </span>
+                    <span className="text-primary shrink-0 text-[11px] font-medium">
+                      {m['code.sessions.restore']()}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="border-border mt-6 rounded-lg border p-3">
+              <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+                <Cloud className="text-primary size-4" />
+                {m['code.runtime.title']()}
+              </div>
+              <div className="space-y-3 text-xs">
+                <Metric
+                  label={m['code.runtime.sandbox']()}
+                  value={m['code.runtime.ready']()}
+                />
+                <Metric
+                  label={m['code.runtime.session_status']()}
+                  value={
+                    currentSession
+                      ? sessionStatusLabel(currentSession.status)
+                      : m['code.sessions.empty']()
+                  }
+                />
+                <Metric
+                  label={m['code.agent.current']()}
+                  value={agentLabel(currentAgent)}
+                />
+                <Metric
+                  label={m['code.model.current']()}
+                  value={modelLabel(models, currentModel)}
+                />
+                <Metric
+                  label={m['code.runtime.tmux']()}
+                  value={statusLabel(status)}
+                />
+                <Metric
+                  label={m['code.runtime.archive']()}
+                  value={archiveMetricValue(currentSession, archiveCheckpoint)}
+                />
+              </div>
+            </div>
+          </aside>
+
+          <section
             className={cn(
-              'border-border mt-6 rounded-lg border p-3',
-              sidebarCollapsed && 'lg:hidden'
+              'min-h-0 min-w-0 flex-col xl:flex',
+              activeWorkbenchPane === 'terminal' ? 'flex' : 'hidden'
             )}
           >
-            <div className="mb-3 flex items-center gap-2 text-sm font-medium">
-              <Cloud className="text-primary size-4" />
-              {m['code.runtime.title']()}
-            </div>
-            <div className="space-y-3 text-xs">
-              <Metric
-                label={m['code.runtime.sandbox']()}
-                value={m['code.runtime.ready']()}
-              />
-              <Metric
-                label={m['code.runtime.session_status']()}
-                value={
-                  currentSession
-                    ? sessionStatusLabel(currentSession.status)
-                    : m['code.sessions.empty']()
-                }
-              />
-              <Metric
-                label={m['code.agent.current']()}
-                value={agentLabel(currentAgent)}
-              />
-              <Metric
-                label={m['code.model.current']()}
-                value={modelLabel(models, currentModel)}
-              />
-              <Metric
-                label={m['code.runtime.tmux']()}
-                value={statusLabel(status)}
-              />
-              <Metric
-                label={m['code.runtime.archive']()}
-                value={archiveMetricValue(currentSession, archiveCheckpoint)}
-              />
-            </div>
-          </div>
-        </aside>
-
-        <section className="grid min-w-0 gap-4 2xl:grid-cols-[minmax(800px,1fr)_320px]">
-          <div className="border-border bg-card min-w-0 overflow-hidden rounded-lg border">
-            <div className="border-border bg-background/80 flex items-center justify-between border-b px-4 py-3">
-              <div className="flex min-w-0 items-center gap-2">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="-ml-2 size-7 shrink-0 lg:hidden"
-                  aria-label={m['code.sidebar.open']()}
-                  title={m['code.sidebar.open']()}
-                  aria-expanded={mobileSidebarOpen}
-                  onClick={() => setMobileSidebarOpen(true)}
-                >
-                  <PanelLeftOpen className="size-4" />
-                </Button>
-                <Terminal className="text-muted-foreground size-4" />
-                <span className="text-sm font-medium">
-                  {m['code.terminal.title']()}
-                </span>
+            <div className="bg-card flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+              <div className="border-border bg-background/80 flex shrink-0 items-center justify-between gap-3 border-b px-3 py-2.5">
+                <div className="flex items-center gap-2">
+                  <Terminal className="text-muted-foreground size-4" />
+                  <span className="shrink-0 text-sm font-medium">
+                    {m['code.terminal.title']()}
+                  </span>
+                </div>
+                <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
+                  <span className="text-muted-foreground hidden shrink-0 text-xs md:inline">
+                    {terminalStatusText}
+                  </span>
+                  <span
+                    className={cn(
+                      'hidden shrink-0 text-xs lg:inline',
+                      focused ? 'text-primary' : 'text-muted-foreground'
+                    )}
+                  >
+                    {focused
+                      ? m['code.terminal.focused']()
+                      : m['code.terminal.unfocused']()}
+                  </span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="size-7 rounded-full"
+                    disabled={!terminalSessionId}
+                    aria-label={m['code.terminal.focus']()}
+                    title={m['code.terminal.focus']()}
+                    onClick={focusTerminal}
+                  >
+                    <Focus className="size-3.5" />
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="size-7 rounded-full"
+                    disabled={!terminalSessionId}
+                    aria-label={m['code.terminal.scrollback']()}
+                    title={m['code.terminal.scrollback']()}
+                    onClick={enterScrollback}
+                  >
+                    <History className="size-3.5" />
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="size-7 rounded-full"
+                    disabled={!terminalSessionId}
+                    aria-label={m['code.terminal.bottom']()}
+                    title={m['code.terminal.bottom']()}
+                    onClick={scrollToBottom}
+                  >
+                    <ArrowDownToLine className="size-3.5" />
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="size-7 rounded-full"
+                    disabled={!terminalSessionId || status !== 'connected'}
+                    aria-label={m['code.terminal.interrupt']()}
+                    title={m['code.terminal.interrupt']()}
+                    onClick={interrupt}
+                  >
+                    <CircleStop className="size-3.5" />
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 rounded-full text-xs"
+                    disabled={
+                      !terminalSessionId ||
+                      Boolean(busyAction) ||
+                      restoreInProgress
+                    }
+                    onClick={() => void reconnectTerminal()}
+                  >
+                    {m['code.terminal.reconnect']()}
+                  </Button>
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <span className="text-muted-foreground text-xs">
-                  {terminalStatusText}
-                </span>
-                <span
-                  className={cn(
-                    'hidden text-xs sm:inline',
-                    focused ? 'text-primary' : 'text-muted-foreground'
-                  )}
-                >
-                  {focused
-                    ? m['code.terminal.focused']()
-                    : m['code.terminal.unfocused']()}
-                </span>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="size-7 rounded-full"
-                  disabled={!terminalSessionId}
-                  aria-label={m['code.terminal.focus']()}
-                  title={m['code.terminal.focus']()}
-                  onClick={focusTerminal}
-                >
-                  <Focus className="size-3.5" />
-                </Button>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="size-7 rounded-full"
-                  disabled={!terminalSessionId}
-                  aria-label={m['code.terminal.scrollback']()}
-                  title={m['code.terminal.scrollback']()}
-                  onClick={enterScrollback}
-                >
-                  <History className="size-3.5" />
-                </Button>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="size-7 rounded-full"
-                  disabled={!terminalSessionId}
-                  aria-label={m['code.terminal.bottom']()}
-                  title={m['code.terminal.bottom']()}
-                  onClick={scrollToBottom}
-                >
-                  <ArrowDownToLine className="size-3.5" />
-                </Button>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="size-7 rounded-full"
-                  disabled={!terminalSessionId || status !== 'connected'}
-                  aria-label={m['code.terminal.interrupt']()}
-                  title={m['code.terminal.interrupt']()}
-                  onClick={interrupt}
-                >
-                  <CircleStop className="size-3.5" />
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  className="h-7 rounded-full text-xs"
-                  disabled={
-                    !terminalSessionId ||
-                    Boolean(busyAction) ||
-                    restoreInProgress
-                  }
-                  onClick={() => void reconnectTerminal()}
-                >
-                  {m['code.terminal.reconnect']()}
-                </Button>
-              </div>
-            </div>
-            <div
-              className={cn(
-                'relative h-[calc(100vh-12rem)] min-h-[620px] overflow-hidden bg-[#17130f] p-3 ring-2 ring-transparent transition-shadow lg:min-h-[720px]',
-                focused && 'ring-primary/30'
-              )}
-              onClick={focusTerminal}
-            >
               <div
-                ref={setTerminalElement}
-                className="h-full min-h-0 w-full cursor-text"
-              />
-              {!sessionId && (
-                <div className="absolute inset-0 flex items-center justify-center bg-[#17130f] px-6 text-center text-sm text-[#f4eadf]/70">
-                  {m['code.sessions.empty']()}
-                </div>
-              )}
-              {sessionId && restoreInProgress && (
-                <div className="absolute inset-0 flex items-center justify-center bg-[#17130f] px-6 text-center text-sm text-[#f4eadf]/70">
-                  {restoreGate.message || m['code.actions.restoring']()}
-                </div>
-              )}
-              {sessionId && runtimeIssue && (
-                <div className="absolute inset-x-4 top-4 rounded-md border border-red-500/40 bg-red-950/85 px-4 py-3 text-sm text-red-50 shadow-lg">
-                  {runtimeIssue}
-                </div>
-              )}
-              {sessionId && billingSuspended && (
-                <div className="absolute inset-0 flex items-center justify-center bg-[#17130f]/95 px-6">
-                  <div className="max-w-md text-center">
-                    <AlertTriangle className="mx-auto size-7 text-amber-400" />
-                    <h3 className="mt-3 text-base font-semibold text-[#f4eadf]">
-                      {m['code.billing.suspended_title']()}
-                    </h3>
-                    <p className="mt-2 text-sm leading-6 text-[#f4eadf]/65">
-                      {m['code.billing.suspended_description']()}
-                    </p>
-                    <Link
-                      href="/settings/top-up"
-                      className={cn(
-                        buttonVariants({ size: 'sm' }),
-                        'mt-4 inline-flex'
-                      )}
-                    >
-                      {m['code.billing.recharge']()}
-                    </Link>
+                className={cn(
+                  'relative min-h-0 flex-1 overflow-hidden bg-[#17130f] p-3 ring-2 ring-transparent transition-shadow',
+                  focused && 'ring-primary/30'
+                )}
+                onClick={focusTerminal}
+              >
+                <div
+                  ref={setTerminalElement}
+                  className="h-full min-h-0 w-full cursor-text"
+                />
+                {!sessionId && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-[#17130f] px-6 text-center text-sm text-[#f4eadf]/70">
+                    {m['code.sessions.empty']()}
                   </div>
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="grid gap-4">
-            <Panel
-              icon={FolderTree}
-              title={m['code.files.title']()}
-              subtitle={m['code.files.subtitle']()}
-            >
-              <div className="h-72 min-h-0 overflow-hidden">
-                <SandboxFileTree
-                  sessionId={sessionId}
-                  sessionStatus={currentSession?.status}
-                  selectedPath={selectedFile?.path}
-                  onFileSelect={setSelectedFile}
-                  labels={{
-                    refresh: m['code.files.refresh'](),
-                    loading: m['code.files.loading'](),
-                    empty: m['code.files.empty'](),
-                    failed: m['code.files.failed'](),
-                    inactive: m['code.files.inactive'](),
-                    truncated: m['code.files.truncated'](),
-                    selected: m['code.files.selected'](),
-                  }}
-                />
-              </div>
-            </Panel>
-
-            <Panel
-              icon={FileSearch}
-              title={m['code.file_preview.title']()}
-              subtitle={m['code.file_preview.subtitle']()}
-            >
-              <div className="h-[32rem] min-h-0 overflow-hidden">
-                <SandboxFilePreview
-                  key={sessionId || 'no-session'}
-                  sessionId={sessionId}
-                  sessionStatus={currentSession?.status}
-                  file={selectedFile}
-                  labels={{
-                    empty: m['code.file_preview.empty'](),
-                    inactive: m['code.file_preview.inactive'](),
-                    loading: m['code.file_preview.loading'](),
-                    failed: m['code.file_preview.failed'](),
-                    unsupported: m['code.file_preview.unsupported'](),
-                    tooLarge: m['code.file_preview.too_large'](),
-                    truncated: m['code.file_preview.truncated'](),
-                    rendered: m['code.file_preview.rendered'](),
-                    source: m['code.file_preview.source'](),
-                    copy: m['code.file_preview.copy'](),
-                    copied: m['code.file_preview.copied'](),
-                    refresh: m['code.file_preview.refresh'](),
-                    mime: m['code.file_preview.mime'](),
-                    size: m['code.file_preview.size'](),
-                    modified: m['code.file_preview.modified'](),
-                    imageAlt: m['code.file_preview.image_alt'](),
-                  }}
-                />
-              </div>
-            </Panel>
-
-            <Panel
-              icon={Play}
-              title={m['code.preview.title']()}
-              subtitle={m['code.preview.subtitle']()}
-            >
-              <div className="border-border bg-background overflow-hidden rounded-md border">
-                {sessionId ? (
-                  terminalSessionId ? (
-                    <iframe
-                      title="preview"
-                      className="h-56 w-full"
-                      src={`${previewUrl(
-                        loader.runtimeBase,
-                        currentRuntimeUserId,
-                        terminalSessionId
-                      )}?t=${previewNonce}`}
-                    />
-                  ) : (
-                    <div className="text-muted-foreground flex h-56 items-center justify-center px-4 text-center text-xs">
-                      {restoreGate.message || m['code.actions.restoring']()}
+                )}
+                {sessionId && restoreInProgress && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-[#17130f] px-6 text-center text-sm text-[#f4eadf]/70">
+                    {restoreGate.message || m['code.actions.restoring']()}
+                  </div>
+                )}
+                {sessionId && runtimeIssue && (
+                  <div className="absolute inset-x-4 top-4 rounded-md border border-red-500/40 bg-red-950/85 px-4 py-3 text-sm text-red-50 shadow-lg">
+                    {runtimeIssue}
+                  </div>
+                )}
+                {sessionId && billingSuspended && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-[#17130f]/95 px-6">
+                    <div className="max-w-md text-center">
+                      <AlertTriangle className="mx-auto size-7 text-amber-400" />
+                      <h3 className="mt-3 text-base font-semibold text-[#f4eadf]">
+                        {m['code.billing.suspended_title']()}
+                      </h3>
+                      <p className="mt-2 text-sm leading-6 text-[#f4eadf]/65">
+                        {m['code.billing.suspended_description']()}
+                      </p>
+                      <Link
+                        href="/settings/top-up"
+                        className={cn(
+                          buttonVariants({ size: 'sm' }),
+                          'mt-4 inline-flex'
+                        )}
+                      >
+                        {m['code.billing.recharge']()}
+                      </Link>
                     </div>
-                  )
-                ) : (
-                  <div className="text-muted-foreground flex h-56 items-center justify-center px-4 text-center text-xs">
-                    {m['code.preview.empty']()}
                   </div>
                 )}
               </div>
-              <Button
-                size="sm"
-                variant="outline"
-                className="mt-3 h-7 rounded-full text-xs"
-                disabled={!terminalSessionId}
-                onClick={() => setPreviewNonce(Date.now())}
-              >
-                {m['code.actions.refresh_preview']()}
-              </Button>
-            </Panel>
+            </div>
+          </section>
 
-            <Panel
-              icon={Archive}
-              title={m['code.archive.title']()}
-              subtitle={m['code.archive.subtitle']()}
+          <aside
+            className={cn(
+              'border-border bg-card relative min-h-0 min-w-0 flex-col xl:flex xl:border-l',
+              activeWorkbenchPane === 'workspace' ? 'flex' : 'hidden'
+            )}
+          >
+            <button
+              type="button"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label={`${m['code.terminal.title']()} / ${m['code.files.title']()}`}
+              aria-valuemin={MIN_WORKSPACE_WIDTH}
+              aria-valuemax={MAX_WORKSPACE_WIDTH}
+              aria-valuenow={Math.round(workspaceWidth)}
+              className="group absolute inset-y-0 -left-1 z-20 hidden w-2 cursor-col-resize touch-none focus-visible:outline-none xl:block"
+              onPointerDown={beginWorkspaceResize}
+              onPointerMove={resizeWorkspace}
+              onPointerUp={finishWorkspaceResize}
+              onPointerCancel={finishWorkspaceResize}
+              onLostPointerCapture={finishWorkspaceResize}
+              onKeyDown={resizeWorkspaceWithKeyboard}
             >
-              <div className="border-primary/50 mb-3 border-l-2 pl-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="text-xs font-medium">
-                      {m['code.archive.status']()}
-                    </p>
-                    <p
-                      className={cn(
-                        'mt-1 text-xs leading-5',
-                        archiveCheckpoint.sessionId === sessionId &&
-                          archiveCheckpoint.state === 'error'
-                          ? 'text-destructive'
-                          : 'text-muted-foreground'
-                      )}
-                    >
-                      {archiveStatusText(currentSession, archiveCheckpoint)}
-                    </p>
-                    {archiveDigest && (
-                      <p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-                        {m['code.archive.digest']({
-                          digest: shortDigest(archiveDigest),
-                        })}
+              <span className="bg-border group-hover:bg-primary group-focus-visible:bg-primary absolute top-1/2 left-1/2 h-12 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full transition-colors" />
+            </button>
+
+            <div className="border-border bg-background/80 flex min-h-12 shrink-0 items-center justify-between gap-2 border-b px-2 py-1.5">
+              <div
+                className="flex min-w-0 items-center gap-1 overflow-x-auto"
+                role="tablist"
+                aria-label={m['code.files.title']()}
+                onKeyDown={moveWorkspaceTabWithKeyboard}
+              >
+                <Button
+                  id="code-workspace-tab-files"
+                  type="button"
+                  size="sm"
+                  variant={workspaceTab === 'files' ? 'secondary' : 'ghost'}
+                  className="h-8 shrink-0 rounded-md px-2.5 text-xs"
+                  role="tab"
+                  aria-selected={workspaceTab === 'files'}
+                  aria-controls="code-workspace-panel-files"
+                  tabIndex={workspaceTab === 'files' ? 0 : -1}
+                  onClick={() => setWorkspaceTab('files')}
+                >
+                  <FolderTree className="size-3.5" />
+                  {m['code.files.title']()}
+                </Button>
+                <Button
+                  id="code-workspace-tab-preview"
+                  type="button"
+                  size="sm"
+                  variant={workspaceTab === 'preview' ? 'secondary' : 'ghost'}
+                  className="h-8 shrink-0 rounded-md px-2.5 text-xs"
+                  role="tab"
+                  aria-selected={workspaceTab === 'preview'}
+                  aria-controls="code-workspace-panel-preview"
+                  tabIndex={workspaceTab === 'preview' ? 0 : -1}
+                  onClick={() => setWorkspaceTab('preview')}
+                >
+                  <Play className="size-3.5" />
+                  {m['code.preview.title']()}
+                </Button>
+                <Button
+                  id="code-workspace-tab-archive"
+                  type="button"
+                  size="sm"
+                  variant={workspaceTab === 'archive' ? 'secondary' : 'ghost'}
+                  className="h-8 shrink-0 rounded-md px-2.5 text-xs"
+                  role="tab"
+                  aria-selected={workspaceTab === 'archive'}
+                  aria-controls="code-workspace-panel-archive"
+                  tabIndex={workspaceTab === 'archive' ? 0 : -1}
+                  onClick={() => setWorkspaceTab('archive')}
+                >
+                  <Archive className="size-3.5" />
+                  {m['code.archive.title']()}
+                </Button>
+              </div>
+              <span className="text-muted-foreground hidden shrink-0 font-mono text-[10px] 2xl:inline">
+                {Math.round(workspaceWidth)}px
+              </span>
+            </div>
+
+            {workspaceTab === 'files' && (
+              <div
+                id="code-workspace-panel-files"
+                ref={workspaceFilesRef}
+                className="grid min-h-0 flex-1"
+                role="tabpanel"
+                aria-labelledby="code-workspace-tab-files"
+                style={{
+                  gridTemplateRows: `${fileTreePercent}% 8px minmax(0, 1fr)`,
+                }}
+              >
+                <section className="flex min-h-0 flex-col overflow-hidden">
+                  <div className="border-border flex shrink-0 items-start gap-2 border-b px-3 py-2.5">
+                    <FolderTree className="text-muted-foreground mt-0.5 size-4 shrink-0" />
+                    <div className="min-w-0">
+                      <h2 className="text-xs font-semibold">
+                        {m['code.files.title']()}
+                      </h2>
+                      <p className="text-muted-foreground mt-0.5 truncate text-[11px]">
+                        {m['code.files.subtitle']()}
                       </p>
-                    )}
+                    </div>
                   </div>
-                  {archiveCheckpoint.sessionId === sessionId &&
-                    archiveCheckpoint.state === 'error' && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-7 shrink-0 rounded-full text-xs"
-                        disabled={controlsDisabled}
-                        onClick={() => void runAction('archive')}
-                      >
-                        {m['code.archive.retry']()}
-                      </Button>
-                    )}
+                  <div className="min-h-0 flex-1 overflow-hidden p-3">
+                    <SandboxFileTree
+                      sessionId={sessionId}
+                      sessionStatus={currentSession?.status}
+                      selectedPath={selectedFile?.path}
+                      onFileSelect={setSelectedFile}
+                      labels={{
+                        refresh: m['code.files.refresh'](),
+                        loading: m['code.files.loading'](),
+                        empty: m['code.files.empty'](),
+                        failed: m['code.files.failed'](),
+                        inactive: m['code.files.inactive'](),
+                        truncated: m['code.files.truncated'](),
+                        selected: m['code.files.selected'](),
+                      }}
+                    />
+                  </div>
+                </section>
+
+                <button
+                  type="button"
+                  role="separator"
+                  aria-orientation="horizontal"
+                  aria-label={`${m['code.files.title']()} / ${m['code.file_preview.title']()}`}
+                  aria-valuemin={MIN_FILE_TREE_PERCENT}
+                  aria-valuemax={MAX_FILE_TREE_PERCENT}
+                  aria-valuenow={Math.round(fileTreePercent)}
+                  className="border-border bg-muted/40 group flex cursor-row-resize touch-none items-center justify-center border-y focus-visible:outline-none"
+                  onPointerDown={beginFileTreeResize}
+                  onPointerMove={resizeFileTree}
+                  onPointerUp={finishFileTreeResize}
+                  onPointerCancel={finishFileTreeResize}
+                  onLostPointerCapture={finishFileTreeResize}
+                  onKeyDown={resizeFileTreeWithKeyboard}
+                >
+                  <span className="bg-muted-foreground/40 group-hover:bg-primary group-focus-visible:bg-primary h-1 w-10 rounded-full transition-colors" />
+                </button>
+
+                <section className="flex min-h-0 flex-col overflow-hidden">
+                  <div className="border-border flex shrink-0 items-start gap-2 border-b px-3 py-2.5">
+                    <FileSearch className="text-muted-foreground mt-0.5 size-4 shrink-0" />
+                    <div className="min-w-0">
+                      <h2 className="text-xs font-semibold">
+                        {m['code.file_preview.title']()}
+                      </h2>
+                      <p className="text-muted-foreground mt-0.5 truncate text-[11px]">
+                        {m['code.file_preview.subtitle']()}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="min-h-0 flex-1 overflow-hidden p-3">
+                    <SandboxFilePreview
+                      key={sessionId || 'no-session'}
+                      sessionId={sessionId}
+                      sessionStatus={currentSession?.status}
+                      file={selectedFile}
+                      labels={{
+                        empty: m['code.file_preview.empty'](),
+                        inactive: m['code.file_preview.inactive'](),
+                        loading: m['code.file_preview.loading'](),
+                        failed: m['code.file_preview.failed'](),
+                        unsupported: m['code.file_preview.unsupported'](),
+                        tooLarge: m['code.file_preview.too_large'](),
+                        truncated: m['code.file_preview.truncated'](),
+                        rendered: m['code.file_preview.rendered'](),
+                        source: m['code.file_preview.source'](),
+                        copy: m['code.file_preview.copy'](),
+                        copied: m['code.file_preview.copied'](),
+                        refresh: m['code.file_preview.refresh'](),
+                        mime: m['code.file_preview.mime'](),
+                        size: m['code.file_preview.size'](),
+                        modified: m['code.file_preview.modified'](),
+                        imageAlt: m['code.file_preview.image_alt'](),
+                      }}
+                    />
+                  </div>
+                </section>
+              </div>
+            )}
+
+            {workspaceTab === 'preview' && (
+              <section
+                id="code-workspace-panel-preview"
+                className="flex min-h-0 flex-1 flex-col"
+                role="tabpanel"
+                aria-labelledby="code-workspace-tab-preview"
+              >
+                <div className="border-border flex shrink-0 items-start justify-between gap-3 border-b px-4 py-3">
+                  <div className="min-w-0">
+                    <h2 className="text-sm font-semibold">
+                      {m['code.preview.title']()}
+                    </h2>
+                    <p className="text-muted-foreground mt-1 text-xs leading-5">
+                      {m['code.preview.subtitle']()}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 shrink-0 rounded-full text-xs"
+                    disabled={!terminalSessionId}
+                    onClick={() => setPreviewNonce(Date.now())}
+                  >
+                    {m['code.actions.refresh_preview']()}
+                  </Button>
                 </div>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 rounded-full text-xs"
-                  disabled={controlsDisabled}
-                  onClick={() => void runAction('health')}
-                >
-                  {m['code.actions.health']()}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 rounded-full text-xs"
-                  disabled={controlsDisabled}
-                  onClick={() => void runAction('inspect')}
-                >
-                  {m['code.actions.inspect']()}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 rounded-full text-xs"
-                  disabled={controlsDisabled}
-                  onClick={() => void runAction('archive')}
-                >
-                  {m['code.actions.archive']()}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 rounded-full text-xs"
-                  disabled={controlsDisabled}
-                  onClick={() => void runAction('restore')}
-                >
-                  {m['code.actions.restore']()}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 rounded-full text-xs"
-                  disabled={controlsDisabled}
-                  onClick={() => void runAction('suspend')}
-                >
-                  {m['code.actions.suspend']()}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="destructive"
-                  className="h-7 rounded-full text-xs"
-                  disabled={controlsDisabled}
-                  onClick={() => void endCurrentSession()}
-                >
-                  <Square className="size-3" />
-                  {m['code.actions.end']()}
-                </Button>
-              </div>
-              <p className="text-muted-foreground mt-3 min-h-4 font-mono text-xs">
-                {actionMsg}
-              </p>
-            </Panel>
-          </div>
-        </section>
+                <div className="bg-background min-h-0 flex-1 overflow-hidden">
+                  {sessionId ? (
+                    terminalSessionId ? (
+                      <iframe
+                        title={m['code.preview.title']()}
+                        className="h-full min-h-0 w-full bg-white"
+                        src={`${previewUrl(
+                          loader.runtimeBase,
+                          currentRuntimeUserId,
+                          terminalSessionId
+                        )}?t=${previewNonce}`}
+                      />
+                    ) : (
+                      <div className="text-muted-foreground flex h-full items-center justify-center px-4 text-center text-xs">
+                        {restoreGate.message || m['code.actions.restoring']()}
+                      </div>
+                    )
+                  ) : (
+                    <div className="text-muted-foreground flex h-full items-center justify-center px-4 text-center text-xs">
+                      {m['code.preview.empty']()}
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
+
+            {workspaceTab === 'archive' && (
+              <section
+                id="code-workspace-panel-archive"
+                className="min-h-0 flex-1 overflow-y-auto p-4"
+                role="tabpanel"
+                aria-labelledby="code-workspace-tab-archive"
+              >
+                <div className="mb-5 flex items-start gap-3">
+                  <div className="bg-muted flex size-9 shrink-0 items-center justify-center rounded-md">
+                    <Archive className="size-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <h2 className="text-sm font-semibold">
+                      {m['code.archive.title']()}
+                    </h2>
+                    <p className="text-muted-foreground mt-1 text-xs leading-5">
+                      {m['code.archive.subtitle']()}
+                    </p>
+                  </div>
+                </div>
+                <div className="border-primary/50 mb-3 border-l-2 pl-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-xs font-medium">
+                        {m['code.archive.status']()}
+                      </p>
+                      <p
+                        className={cn(
+                          'mt-1 text-xs leading-5',
+                          archiveCheckpoint.sessionId === sessionId &&
+                            archiveCheckpoint.state === 'error'
+                            ? 'text-destructive'
+                            : 'text-muted-foreground'
+                        )}
+                      >
+                        {archiveStatusText(currentSession, archiveCheckpoint)}
+                      </p>
+                      {archiveDigest && (
+                        <p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+                          {m['code.archive.digest']({
+                            digest: shortDigest(archiveDigest),
+                          })}
+                        </p>
+                      )}
+                    </div>
+                    {archiveCheckpoint.sessionId === sessionId &&
+                      archiveCheckpoint.state === 'error' && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 shrink-0 rounded-full text-xs"
+                          disabled={controlsDisabled}
+                          onClick={() => void runAction('archive')}
+                        >
+                          {m['code.archive.retry']()}
+                        </Button>
+                      )}
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 rounded-full text-xs"
+                    disabled={controlsDisabled}
+                    onClick={() => void runAction('health')}
+                  >
+                    {m['code.actions.health']()}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 rounded-full text-xs"
+                    disabled={controlsDisabled}
+                    onClick={() => void runAction('inspect')}
+                  >
+                    {m['code.actions.inspect']()}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 rounded-full text-xs"
+                    disabled={controlsDisabled}
+                    onClick={() => void runAction('archive')}
+                  >
+                    {m['code.actions.archive']()}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 rounded-full text-xs"
+                    disabled={controlsDisabled}
+                    onClick={() => void runAction('restore')}
+                  >
+                    {m['code.actions.restore']()}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 rounded-full text-xs"
+                    disabled={controlsDisabled}
+                    onClick={() => void runAction('suspend')}
+                  >
+                    {m['code.actions.suspend']()}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    className="h-7 rounded-full text-xs"
+                    disabled={controlsDisabled}
+                    onClick={() => void endCurrentSession()}
+                  >
+                    <Square className="size-3" />
+                    {m['code.actions.end']()}
+                  </Button>
+                </div>
+                <p className="text-muted-foreground mt-3 min-h-4 font-mono text-xs">
+                  {actionMsg}
+                </p>
+              </section>
+            )}
+          </aside>
+        </div>
       </main>
 
       <Dialog
@@ -1885,35 +2186,6 @@ function statusLabel(status: TerminalStatus): string {
     default:
       return m['code.terminal.idle']();
   }
-}
-
-function Panel({
-  icon: Icon,
-  title,
-  subtitle,
-  children,
-}: {
-  icon: LucideIcon;
-  title: string;
-  subtitle: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="border-border bg-card rounded-lg border p-4">
-      <div className="mb-4 flex items-start gap-3">
-        <div className="bg-muted text-foreground flex size-9 shrink-0 items-center justify-center rounded-md">
-          <Icon className="size-4" />
-        </div>
-        <div>
-          <h2 className="text-sm font-semibold">{title}</h2>
-          <p className="text-muted-foreground mt-1 text-xs leading-5">
-            {subtitle}
-          </p>
-        </div>
-      </div>
-      {children}
-    </div>
-  );
 }
 
 const getCodeSession = createServerFn().handler(async () => {
