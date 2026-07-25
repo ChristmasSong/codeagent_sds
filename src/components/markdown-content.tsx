@@ -18,6 +18,10 @@ const md = new MarkdownIt({
   linkify: true,
 });
 
+interface MarkdownRenderEnvironment {
+  allowImages?: boolean;
+}
+
 // Headings get stable IDs so in-content anchors work
 md.renderer.rules.heading_open = function (tokens, idx) {
   const token = tokens[idx];
@@ -37,6 +41,18 @@ md.renderer.rules.link_open = function (tokens, idx, options, _env, renderer) {
   if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
     token.attrSet('rel', 'nofollow noopener');
     token.attrSet('target', '_blank');
+  }
+  return renderer.renderToken(tokens, idx, options);
+};
+
+const defaultImageRenderer = md.renderer.rules.image;
+md.renderer.rules.image = function (tokens, idx, options, env, renderer) {
+  if ((env as MarkdownRenderEnvironment).allowImages === false) {
+    const alt = md.utils.escapeHtml(tokens[idx].content || 'image');
+    return `<span>[${alt}]</span>`;
+  }
+  if (defaultImageRenderer) {
+    return defaultImageRenderer(tokens, idx, options, env, renderer);
   }
   return renderer.renderToken(tokens, idx, options);
 };
@@ -65,11 +81,13 @@ export const markdownStyles = cn(
 export function MarkdownContent({
   content,
   className,
+  allowImages = true,
 }: {
   content: string;
   className?: string;
+  allowImages?: boolean;
 }) {
-  const html = content ? md.render(content) : '';
+  const html = content ? md.render(content, { allowImages }) : '';
 
   return (
     <div

@@ -9,6 +9,7 @@ import {
   shouldRestoreWorkspace,
   terminalHttpUrl,
   terminalWsUrl,
+  workspaceFilesUrl,
 } from './runtime';
 
 // sanitizeUserId
@@ -116,6 +117,20 @@ assert.equal(
 assert.equal(
   previewUrl('https://rt.example.dev', 'u1', 's1'),
   'https://rt.example.dev/preview/u1/s1/'
+);
+
+// workspaceFilesUrl
+assert.equal(
+  workspaceFilesUrl('https://rt.example.dev', 'u1', 's1'),
+  'https://rt.example.dev/files/u1/s1'
+);
+assert.equal(
+  workspaceFilesUrl('https://rt.example.dev/', 'u 1', 's/1', 'status'),
+  'https://rt.example.dev/files/u%201/s%2F1/status'
+);
+assert.equal(
+  workspaceFilesUrl('https://rt.example.dev/', 'u 1', 's/1', 'content'),
+  'https://rt.example.dev/files/u%201/s%2F1/content'
 );
 
 console.log('runtime.test.ts OK');

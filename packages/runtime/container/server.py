@@ -1,7 +1,12 @@
+from __future__ import annotations
+
 import base64
+import errno
+import heapq
 import hashlib
 import io
 import json
+import mimetypes
 import os
 import pty
 import pwd
@@ -12,6 +17,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import stat
 import struct
 import subprocess
 import tarfile
@@ -23,7 +29,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path, PurePosixPath
 from typing import Optional
-from urllib.parse import unquote, urlparse, parse_qs
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 ROOT = Path("/workspace/sessions")
@@ -72,6 +78,92 @@ class RuntimeOperationError(Exception):
         self.details = details or {}
 
 
+IGNORED_WORKSPACE_DIRS = {
+    ".git",
+    ".next",
+    ".output",
+    ".turbo",
+    ".cache",
+    "node_modules",
+    "coverage",
+}
+MAX_DIRECTORY_ENTRIES = 500
+MAX_STATUS_ENTRIES = 20000
+MAX_WORKSPACE_FILE_PATH_LENGTH = 1024
+MAX_TEXT_PREVIEW_BYTES = 1024 * 1024
+MAX_IMAGE_PREVIEW_BYTES = 10 * 1024 * 1024
+MAX_PDF_PREVIEW_BYTES = 20 * 1024 * 1024
+TEXT_PREVIEW_SUFFIXES = {
+    "",
+    ".c",
+    ".cc",
+    ".conf",
+    ".cpp",
+    ".cs",
+    ".css",
+    ".csv",
+    ".env.example",
+    ".go",
+    ".graphql",
+    ".h",
+    ".hpp",
+    ".ini",
+    ".java",
+    ".js",
+    ".jsx",
+    ".json",
+    ".jsonc",
+    ".kt",
+    ".less",
+    ".log",
+    ".lua",
+    ".mjs",
+    ".php",
+    ".properties",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sass",
+    ".scss",
+    ".sh",
+    ".sql",
+    ".svelte",
+    ".swift",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".vue",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+MARKDOWN_PREVIEW_SUFFIXES = {".md", ".markdown", ".mdx"}
+HTML_PREVIEW_SUFFIXES = {".htm", ".html"}
+IMAGE_PREVIEW_TYPES = {
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+SENSITIVE_WORKSPACE_NAMES = {
+    "credentials.json",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+}
+SENSITIVE_WORKSPACE_SUFFIXES = {".key", ".p12", ".pfx", ".pem"}
+
+
+class WorkspacePreviewError(Exception):
+    def __init__(self, code: str, status: int):
+        super().__init__(code)
+        self.code = code
+        self.status = status
+
+
 def safe_name(raw: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", raw)[:80] or "default"
 
@@ -100,12 +192,486 @@ def session_path(session_id: str) -> Path:
     return ROOT / safe_name(session_id)
 
 
+def workspace_path(session_id: str, requested_path: str = "") -> tuple[Path, Path]:
+    root = session_path(session_id).resolve()
+    raw = requested_path or ""
+    if "\x00" in raw or Path(raw).is_absolute():
+        raise ValueError("invalid workspace path")
+    candidate = (root / raw).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError("workspace path escapes session root")
+    return root, candidate
+
+
+def workspace_file_parts(requested_path: str) -> list[str]:
+    raw = requested_path or ""
+    if (
+        not raw
+        or len(raw) > MAX_WORKSPACE_FILE_PATH_LENGTH
+        or "\x00" in raw
+        or Path(raw).is_absolute()
+    ):
+        raise WorkspacePreviewError("invalid_path", 400)
+
+    parts = raw.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        raise WorkspacePreviewError("invalid_path", 400)
+    for part in parts:
+        lowered = part.lower()
+        if (
+            should_skip_workspace_name(part, False)
+            or lowered in SENSITIVE_WORKSPACE_NAMES
+            or Path(lowered).suffix in SENSITIVE_WORKSPACE_SUFFIXES
+        ):
+            raise WorkspacePreviewError("file_not_available", 404)
+    return parts
+
+
+def open_workspace_file(session_id: str, requested_path: str):
+    parts = workspace_file_parts(requested_path)
+    root = session_path(session_id)
+    root_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    root_flags |= getattr(os, "O_DIRECTORY", 0)
+    root_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = root_flags
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    file_flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_flags |= getattr(os, "O_NONBLOCK", 0)
+
+    opened: list[int] = []
+    try:
+        current_fd = os.open(root, root_flags)
+        opened.append(current_fd)
+        for part in parts[:-1]:
+            current_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            opened.append(current_fd)
+        file_fd = os.open(parts[-1], file_flags, dir_fd=current_fd)
+        opened.append(file_fd)
+        stat_result = os.fstat(file_fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise WorkspacePreviewError("not_a_file", 400)
+        return file_fd, stat_result, "/".join(parts), opened
+    except WorkspacePreviewError:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        if error.errno in {
+            errno.ELOOP,
+            errno.ENOENT,
+            errno.ENOTDIR,
+            errno.EACCES,
+            errno.EPERM,
+        }:
+            raise WorkspacePreviewError("file_not_available", 404) from None
+        raise WorkspacePreviewError("file_read_failed", 500) from None
+
+
+def close_workspace_file(opened: list[int]):
+    for descriptor in reversed(opened):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def workspace_preview_type(filename: str) -> tuple[str, str]:
+    suffix = Path(filename).suffix.lower()
+    if suffix in MARKDOWN_PREVIEW_SUFFIXES:
+        return "markdown", "text/markdown; charset=utf-8"
+    if suffix in HTML_PREVIEW_SUFFIXES:
+        return "html", "text/html; charset=utf-8"
+    if suffix == ".svg":
+        return "svg", "image/svg+xml; charset=utf-8"
+    if suffix == ".pdf":
+        return "pdf", "application/pdf"
+    if suffix in IMAGE_PREVIEW_TYPES:
+        return "image", IMAGE_PREVIEW_TYPES[suffix]
+    if suffix in TEXT_PREVIEW_SUFFIXES:
+        guessed, _ = mimetypes.guess_type(filename)
+        content_type = guessed or "text/plain"
+        if content_type == "application/json" or content_type.startswith("text/"):
+            content_type = f"{content_type}; charset=utf-8"
+        else:
+            content_type = "text/plain; charset=utf-8"
+        return "text", content_type
+    return "binary", "application/octet-stream"
+
+
+def workspace_preview_limit(kind: str) -> int:
+    if kind == "image":
+        return MAX_IMAGE_PREVIEW_BYTES
+    if kind == "pdf":
+        return MAX_PDF_PREVIEW_BYTES
+    return MAX_TEXT_PREVIEW_BYTES
+
+
+def valid_preview_signature(kind: str, suffix: str, sample: bytes) -> bool:
+    if kind == "image":
+        if suffix == ".png":
+            return sample.startswith(b"\x89PNG\r\n\x1a\n")
+        if suffix in {".jpg", ".jpeg"}:
+            return sample.startswith(b"\xff\xd8\xff")
+        if suffix == ".gif":
+            return sample.startswith((b"GIF87a", b"GIF89a"))
+        if suffix == ".webp":
+            return (
+                len(sample) >= 12
+                and sample.startswith(b"RIFF")
+                and sample[8:12] == b"WEBP"
+            )
+    if kind == "pdf":
+        return sample.startswith(b"%PDF-")
+    return True
+
+
+def decode_workspace_text(data: bytes, truncated: bool) -> str | None:
+    if b"\x00" in data[:8192]:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        if not truncated or error.reason != "unexpected end of data":
+            return None
+        for trim in range(1, min(4, len(data)) + 1):
+            try:
+                return data[:-trim].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        return None
+
+
+def workspace_file_etag(stat_result) -> str:
+    value = (
+        f"{stat_result.st_size}\0{stat_result.st_mtime_ns}\0"
+        f"{stat_result.st_ino}"
+    ).encode()
+    return hashlib.sha256(value).hexdigest()
+
+
+def workspace_file_preview(session_id: str, requested_path: str):
+    file_fd, stat_result, relative_path, opened = open_workspace_file(
+        session_id, requested_path
+    )
+    try:
+        name = Path(relative_path).name
+        suffix = Path(name).suffix.lower()
+        kind, content_type = workspace_preview_type(name)
+        limit = workspace_preview_limit(kind)
+        too_large = stat_result.st_size > limit
+        raw_available = kind in {"image", "pdf", "html", "svg"} and not too_large
+        previewable = kind != "binary" and (not too_large or kind in {
+            "text",
+            "markdown",
+            "html",
+            "svg",
+        })
+        content = None
+        encoding = None
+        truncated = False
+
+        if kind in {"image", "pdf"}:
+            sample = os.read(file_fd, 32)
+            if not valid_preview_signature(kind, suffix, sample):
+                kind = "binary"
+                content_type = "application/octet-stream"
+                previewable = False
+                raw_available = False
+                too_large = False
+        elif kind in {"text", "markdown", "html", "svg"}:
+            data = os.read(file_fd, limit + 1)
+            truncated = len(data) > limit or stat_result.st_size > limit
+            data = data[:limit]
+            decoded = decode_workspace_text(data, truncated)
+            if decoded is None:
+                kind = "binary"
+                content_type = "application/octet-stream"
+                previewable = False
+                raw_available = False
+                too_large = False
+                truncated = False
+            elif kind == "svg" and "<svg" not in decoded[:4096].lower():
+                kind = "text"
+                content_type = "text/plain; charset=utf-8"
+                previewable = True
+                raw_available = False
+                content = decoded
+                encoding = "utf-8"
+            else:
+                content = decoded
+                encoding = "utf-8"
+
+        return {
+            "ok": True,
+            "exists": True,
+            "path": relative_path,
+            "name": name,
+            "size": stat_result.st_size,
+            "mtime": iso_mtime(stat_result),
+            "mimeType": content_type,
+            "kind": kind,
+            "encoding": encoding,
+            "etag": workspace_file_etag(stat_result),
+            "previewable": previewable,
+            "rawAvailable": raw_available,
+            "tooLarge": too_large,
+            "truncated": truncated,
+            **({"content": content} if content is not None else {}),
+        }
+    finally:
+        close_workspace_file(opened)
+
+
+def send_workspace_file_headers(
+    handler,
+    *,
+    relative_path: str,
+    stat_result,
+    content_type: str,
+    kind: str,
+):
+    handler.send_header("content-type", content_type)
+    handler.send_header("content-length", str(stat_result.st_size))
+    handler.send_header(
+        "content-disposition",
+        f"inline; filename*=UTF-8''{quote(Path(relative_path).name, safe='')}",
+    )
+    handler.send_header("etag", f'"{workspace_file_etag(stat_result)}"')
+    handler.send_header("cache-control", "private, no-store")
+    handler.send_header("x-content-type-options", "nosniff")
+    handler.send_header("x-file-path", quote(relative_path, safe="/"))
+    handler.send_header("x-file-size", str(stat_result.st_size))
+    handler.send_header("x-file-mtime", iso_mtime(stat_result))
+    handler.send_header("x-file-preview-kind", kind)
+    if kind in {"html", "svg"}:
+        handler.send_header(
+            "content-security-policy",
+            "sandbox; default-src 'none'; img-src data: blob:; "
+            "style-src 'unsafe-inline'; font-src data:",
+        )
+
+
+def serve_workspace_file_raw(handler, session_id: str, requested_path: str):
+    file_fd, stat_result, relative_path, opened = open_workspace_file(
+        session_id, requested_path
+    )
+    try:
+        name = Path(relative_path).name
+        suffix = Path(name).suffix.lower()
+        kind, content_type = workspace_preview_type(name)
+        if kind not in {"image", "pdf", "html", "svg"}:
+            raise WorkspacePreviewError("unsupported_file", 415)
+        if stat_result.st_size > workspace_preview_limit(kind):
+            raise WorkspacePreviewError("file_too_large", 413)
+
+        sample = os.read(file_fd, min(stat_result.st_size, 8192))
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        if kind in {"image", "pdf"} and not valid_preview_signature(
+            kind, suffix, sample
+        ):
+            raise WorkspacePreviewError("unsupported_file", 415)
+        if kind in {"html", "svg"}:
+            decoded = decode_workspace_text(sample, stat_result.st_size > len(sample))
+            if decoded is None:
+                raise WorkspacePreviewError("unsupported_file", 415)
+            if kind == "svg" and "<svg" not in decoded.lower():
+                raise WorkspacePreviewError("unsupported_file", 415)
+
+        handler.send_response(200)
+        send_workspace_file_headers(
+            handler,
+            relative_path=relative_path,
+            stat_result=stat_result,
+            content_type=content_type,
+            kind=kind,
+        )
+        handler.end_headers()
+        while True:
+            chunk = os.read(file_fd, 64 * 1024)
+            if not chunk:
+                break
+            handler.wfile.write(chunk)
+    finally:
+        close_workspace_file(opened)
+
+
+def should_skip_workspace_name(name: str, show_hidden: bool) -> bool:
+    if name in IGNORED_WORKSPACE_DIRS:
+        return True
+    return not show_hidden and name.startswith(".")
+
+
+def iso_mtime(stat_result) -> str:
+    return datetime.fromtimestamp(
+        stat_result.st_mtime, tz=timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+
+
+def directory_has_children(path: Path, show_hidden: bool) -> bool:
+    try:
+        with os.scandir(path) as children:
+            for child in children:
+                if should_skip_workspace_name(child.name, show_hidden):
+                    continue
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def directory_entry_sort_key(item):
+    try:
+        is_directory = item.is_dir(follow_symlinks=False)
+    except OSError:
+        is_directory = False
+    return (not is_directory, item.name.lower())
+
+
+def list_workspace_directory(
+    session_id: str, requested_path: str = "", show_hidden: bool = False
+):
+    root, directory = workspace_path(session_id, requested_path)
+    if not root.exists():
+        return {
+            "ok": True,
+            "session": session_id,
+            "exists": False,
+            "path": "",
+            "entries": [],
+            "truncated": False,
+        }
+    if not directory.exists():
+        raise FileNotFoundError("workspace directory not found")
+    if not directory.is_dir():
+        raise NotADirectoryError("workspace path is not a directory")
+
+    relative = "" if directory == root else directory.relative_to(root).as_posix()
+    entries = []
+    with os.scandir(directory) as scanned:
+        children = heapq.nsmallest(
+            MAX_DIRECTORY_ENTRIES + 1,
+            (
+                child
+                for child in scanned
+                if not should_skip_workspace_name(child.name, show_hidden)
+            ),
+            key=directory_entry_sort_key,
+        )
+    truncated = len(children) > MAX_DIRECTORY_ENTRIES
+    for scanned_child in children[:MAX_DIRECTORY_ENTRIES]:
+        child = Path(scanned_child.path)
+        try:
+            stat_result = os.stat(child, follow_symlinks=False)
+            if stat.S_ISLNK(stat_result.st_mode):
+                continue
+            is_directory = stat.S_ISDIR(stat_result.st_mode)
+            if not is_directory and not stat.S_ISREG(stat_result.st_mode):
+                continue
+            resolved = child.resolve()
+            if resolved != root and root not in resolved.parents:
+                continue
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+
+        entries.append(
+            {
+                "name": child.name,
+                "path": child.relative_to(root).as_posix(),
+                "type": "directory" if is_directory else "file",
+                "size": None if is_directory else stat_result.st_size,
+                "mtime": iso_mtime(stat_result),
+                "hasChildren": directory_has_children(child, show_hidden)
+                if is_directory
+                else False,
+            }
+        )
+
+    return {
+        "ok": True,
+        "session": session_id,
+        "exists": True,
+        "path": relative,
+        "entries": entries,
+        "truncated": truncated,
+    }
+
+
+def workspace_metadata_status(session_id: str, show_hidden: bool = False):
+    root, _ = workspace_path(session_id)
+    if not root.exists():
+        return {
+            "ok": True,
+            "session": session_id,
+            "exists": False,
+            "digest": None,
+            "entryCount": 0,
+            "truncated": False,
+        }
+
+    digest_value = 0
+    entry_count = 0
+    truncated = False
+    directories = [root]
+    while directories and not truncated:
+        current = directories.pop()
+        discovered_directories = []
+        try:
+            with os.scandir(current) as scanned:
+                for item in scanned:
+                    if should_skip_workspace_name(item.name, show_hidden):
+                        continue
+                    path = Path(item.path)
+                    try:
+                        if item.is_symlink():
+                            continue
+                        resolved = path.resolve()
+                        if resolved != root and root not in resolved.parents:
+                            continue
+                        stat_result = item.stat(follow_symlinks=False)
+                        is_directory = item.is_dir(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    relative = path.relative_to(root).as_posix()
+                    kind = "d" if is_directory else "f"
+                    record = (
+                        f"{kind}\0{relative}\0{stat_result.st_size}\0"
+                        f"{stat_result.st_mtime_ns}\0"
+                    ).encode()
+                    digest_value ^= int.from_bytes(
+                        hashlib.sha256(record).digest(), "big"
+                    )
+                    entry_count += 1
+                    if entry_count >= MAX_STATUS_ENTRIES:
+                        truncated = True
+                        break
+                    if is_directory:
+                        discovered_directories.append(path)
+        except OSError:
+            continue
+        directories.extend(discovered_directories)
+
+    digest = hashlib.sha256(
+        f"{entry_count}\0{digest_value:064x}".encode()
+    ).hexdigest()
+
+    return {
+        "ok": True,
+        "session": session_id,
+        "exists": True,
+        "digest": digest,
+        "entryCount": entry_count,
+        "truncated": truncated,
+    }
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
 def write_json(handler, status: int, data):
-    body = json.dumps(data, indent=2).encode()
+    body = json.dumps(data, indent=2, ensure_ascii=False).encode()
     handler.send_response(status)
     handler.send_header("content-type", "application/json; charset=utf-8")
     handler.send_header("content-length", str(len(body)))
@@ -921,6 +1487,38 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 2 and parts[0] == "inspect":
                 write_json(self, 200, workspace_manifest(parts[1]))
                 return
+            if len(parts) in {2, 3} and parts[0] == "files":
+                query = parse_qs(parsed.query)
+                show_hidden = query.get("showHidden", ["false"])[0].lower() == "true"
+                if len(parts) == 3 and parts[2] == "status":
+                    write_json(
+                        self,
+                        200,
+                        workspace_metadata_status(parts[1], show_hidden),
+                    )
+                    return
+                if len(parts) == 3 and parts[2] == "content":
+                    requested_path = query.get("path", [""])[0]
+                    if query.get("raw", ["false"])[0].lower() == "true":
+                        serve_workspace_file_raw(
+                            self, parts[1], requested_path
+                        )
+                    else:
+                        write_json(
+                            self,
+                            200,
+                            workspace_file_preview(parts[1], requested_path),
+                        )
+                    return
+                if len(parts) == 2:
+                    write_json(
+                        self,
+                        200,
+                        list_workspace_directory(
+                            parts[1], query.get("path", [""])[0], show_hidden
+                        ),
+                    )
+                    return
             if len(parts) == 2 and parts[0] == "tmux":
                 query = parse_qs(parsed.query)
                 agent = safe_agent(query.get("agent", ["claude"])[0])
@@ -968,6 +1566,16 @@ class Handler(BaseHTTPRequestHandler):
                 serve_file(self, file_path)
                 return
             write_json(self, 404, {"ok": False, "error": "not_found", "path": parsed.path})
+        except WorkspacePreviewError as error:
+            write_json(
+                self,
+                error.status,
+                {"ok": False, "error": error.code},
+            )
+        except ValueError as error:
+            write_json(self, 400, {"ok": False, "error": str(error)})
+        except (FileNotFoundError, NotADirectoryError) as error:
+            write_json(self, 404, {"ok": False, "error": str(error)})
         except Exception as error:
             write_runtime_error(self, error, "request.get")
 

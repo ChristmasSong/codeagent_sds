@@ -10,8 +10,9 @@ import {
   CircleStop,
   Cloud,
   Coins,
-  FileDiff,
+  FileSearch,
   Focus,
+  FolderTree,
   History,
   PanelLeftClose,
   PanelLeftOpen,
@@ -43,7 +44,10 @@ import {
   type TerminalStatus,
 } from '@/modules/code/use-terminal-session';
 import { ApiError, apiGet, apiPost } from '@/lib/api-client';
+import type { WorkspaceFileEntry } from '@/lib/code-files';
 import { cn } from '@/lib/utils';
+import { SandboxFilePreview } from '@/components/code-workspace/sandbox-file-preview';
+import { SandboxFileTree } from '@/components/code-workspace/sandbox-file-tree';
 import { Button, buttonVariants } from '@/components/ui/button';
 import {
   Dialog,
@@ -157,6 +161,9 @@ function CodeWorkspacePage() {
   const [runtimeIssue, setRuntimeIssue] = useState<string>('');
   const [busyAction, setBusyAction] = useState<string>('');
   const [previewNonce, setPreviewNonce] = useState(0);
+  const [selectedFile, setSelectedFile] = useState<WorkspaceFileEntry | null>(
+    null
+  );
   const [restoredSessionIds, setRestoredSessionIds] = useState<
     Record<string, true>
   >({});
@@ -354,6 +361,7 @@ function CodeWorkspacePage() {
 
   useEffect(() => {
     setRuntimeIssue('');
+    setSelectedFile(null);
   }, [sessionId]);
 
   useEffect(() => {
@@ -1269,13 +1277,60 @@ function CodeWorkspacePage() {
 
           <div className="grid gap-4">
             <Panel
-              icon={FileDiff}
-              title={m['code.diff.title']()}
-              subtitle={m['code.diff.subtitle']()}
+              icon={FolderTree}
+              title={m['code.files.title']()}
+              subtitle={m['code.files.subtitle']()}
             >
-              <p className="text-muted-foreground text-xs">
-                {m['code.diff.soon']()}
-              </p>
+              <div className="h-72 min-h-0 overflow-hidden">
+                <SandboxFileTree
+                  sessionId={sessionId}
+                  sessionStatus={currentSession?.status}
+                  selectedPath={selectedFile?.path}
+                  onFileSelect={setSelectedFile}
+                  labels={{
+                    refresh: m['code.files.refresh'](),
+                    loading: m['code.files.loading'](),
+                    empty: m['code.files.empty'](),
+                    failed: m['code.files.failed'](),
+                    inactive: m['code.files.inactive'](),
+                    truncated: m['code.files.truncated'](),
+                    selected: m['code.files.selected'](),
+                  }}
+                />
+              </div>
+            </Panel>
+
+            <Panel
+              icon={FileSearch}
+              title={m['code.file_preview.title']()}
+              subtitle={m['code.file_preview.subtitle']()}
+            >
+              <div className="h-[32rem] min-h-0 overflow-hidden">
+                <SandboxFilePreview
+                  key={sessionId || 'no-session'}
+                  sessionId={sessionId}
+                  sessionStatus={currentSession?.status}
+                  file={selectedFile}
+                  labels={{
+                    empty: m['code.file_preview.empty'](),
+                    inactive: m['code.file_preview.inactive'](),
+                    loading: m['code.file_preview.loading'](),
+                    failed: m['code.file_preview.failed'](),
+                    unsupported: m['code.file_preview.unsupported'](),
+                    tooLarge: m['code.file_preview.too_large'](),
+                    truncated: m['code.file_preview.truncated'](),
+                    rendered: m['code.file_preview.rendered'](),
+                    source: m['code.file_preview.source'](),
+                    copy: m['code.file_preview.copy'](),
+                    copied: m['code.file_preview.copied'](),
+                    refresh: m['code.file_preview.refresh'](),
+                    mime: m['code.file_preview.mime'](),
+                    size: m['code.file_preview.size'](),
+                    modified: m['code.file_preview.modified'](),
+                    imageAlt: m['code.file_preview.image_alt'](),
+                  }}
+                />
+              </div>
             </Panel>
 
             <Panel
