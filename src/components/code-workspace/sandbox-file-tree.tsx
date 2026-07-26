@@ -48,6 +48,7 @@ export function SandboxFileTree({
   const effectiveStatus =
     workspaceStatus.data?.sessionStatus || sessionStatus || 'active';
   const canRead = isActive && visible && effectiveStatus === 'active';
+  const canRefresh = isActive && visible;
   const root = useSandboxDirectory(sessionId, '', canRead);
 
   return (
@@ -61,7 +62,7 @@ export function SandboxFileTree({
           className="text-muted-foreground hover:bg-muted hover:text-foreground inline-flex size-7 shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50"
           aria-label={labels.refresh}
           title={labels.refresh}
-          disabled={!canRead || workspaceStatus.isFetching}
+          disabled={!canRefresh || workspaceStatus.isFetching}
           onClick={() => void workspaceStatus.refresh()}
         >
           <RefreshCw
@@ -74,7 +75,7 @@ export function SandboxFileTree({
       </div>
 
       <div className="border-border bg-background min-h-0 flex-1 overflow-auto rounded-md border py-1">
-        {!sessionId || effectiveStatus !== 'active' ? (
+        {!isActive || effectiveStatus !== 'active' ? (
           <TreeMessage>{labels.inactive}</TreeMessage>
         ) : root.isPending ? (
           <TreeMessage>

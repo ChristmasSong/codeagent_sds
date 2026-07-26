@@ -3,9 +3,13 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { apiGet } from '@/lib/api-client';
 import {
+  nextWorkspaceStatusPollState,
+  shouldConfirmWorkspaceStatus,
   workspaceStatusPollInterval,
   type WorkspaceDirectoryResult,
   type WorkspaceFileContentResult,
+  type WorkspaceStatusPollState,
+  type WorkspaceStatusPollTarget,
   type WorkspaceStatusResult,
 } from '@/lib/code-files';
 
@@ -64,64 +68,65 @@ export function sandboxFileRawUrl(
 
 export function useWorkspaceStatus(sessionId: string | null, enabled: boolean) {
   const queryClient = useQueryClient();
-  const previousStatus = useRef<{
-    sessionId: string | null;
-    digest: string | null | undefined;
-  }>({ sessionId: null, digest: undefined });
-  const pollState = useRef<{
-    sessionId: string | null;
-    digest: string | null | undefined;
-    stableChecks: number;
-  }>({ sessionId: null, digest: undefined, stableChecks: 0 });
+  const previousDigests = useRef(new Map<string, string | null>());
+  const pollStates = useRef(new Map<string, WorkspaceStatusPollState>());
+  const previousTarget = useRef<WorkspaceStatusPollTarget>({
+    sessionId: null,
+    enabled: false,
+  });
   const statusQuery = useQuery({
     queryKey: ['code-workspace-status', sessionId],
     queryFn: async () => {
       const result = await apiGet<WorkspaceStatusResult>(
         filesEndpoint(sessionId!, { operation: 'status' })
       );
-      const previous = pollState.current;
-      if (previous.sessionId !== sessionId) {
-        pollState.current = {
-          sessionId,
-          digest: result.digest,
-          stableChecks: 0,
-        };
-      } else if (previous.digest === result.digest) {
-        pollState.current = {
-          ...previous,
-          stableChecks: previous.stableChecks + 1,
-        };
-      } else {
-        pollState.current = {
-          sessionId,
-          digest: result.digest,
-          stableChecks: 0,
-        };
-      }
+      pollStates.current.set(
+        sessionId!,
+        nextWorkspaceStatusPollState(
+          pollStates.current.get(sessionId!),
+          sessionId!,
+          result
+        )
+      );
       return result;
     },
     enabled: Boolean(sessionId && enabled),
     refetchInterval: (query) => {
       const data = query.state.data;
-      if (data?.sessionStatus && data.sessionStatus !== 'active') return false;
       if (query.state.status === 'error') return 120_000;
-      return workspaceStatusPollInterval(pollState.current.stableChecks);
+      if (data?.sessionStatus && data.sessionStatus !== 'active') {
+        return 120_000;
+      }
+      const stableChecks = sessionId
+        ? (pollStates.current.get(sessionId)?.stableChecks ?? 0)
+        : 0;
+      return workspaceStatusPollInterval(stableChecks);
     },
     refetchIntervalInBackground: false,
     staleTime: 10_000,
     retry: 1,
   });
 
+  const statusRefetch = statusQuery.refetch;
+  useEffect(() => {
+    const nextTarget = {
+      sessionId,
+      enabled: Boolean(sessionId && enabled),
+    };
+    const previous = previousTarget.current;
+    previousTarget.current = nextTarget;
+
+    const shouldConfirm = shouldConfirmWorkspaceStatus(previous, nextTarget);
+    if (shouldConfirm && statusQuery.fetchStatus !== 'fetching') {
+      void statusRefetch();
+    }
+  }, [enabled, sessionId, statusQuery.fetchStatus, statusRefetch]);
+
   useEffect(() => {
     const digest = statusQuery.data?.digest;
-    if (digest === undefined) return;
-    const previous = previousStatus.current;
-    if (
-      previous.sessionId === sessionId &&
-      previous.digest !== undefined &&
-      previous.digest !== digest &&
-      sessionId
-    ) {
+    if (digest === undefined || !sessionId) return;
+    const previousDigest = previousDigests.current.get(sessionId);
+    if (previousDigest !== undefined && previousDigest !== digest) {
       void queryClient.invalidateQueries({
         queryKey: ['code-files', sessionId],
       });
@@ -129,7 +134,7 @@ export function useWorkspaceStatus(sessionId: string | null, enabled: boolean) {
         queryKey: ['code-file-content', sessionId],
       });
     }
-    previousStatus.current = { sessionId, digest };
+    previousDigests.current.set(sessionId, digest);
   }, [queryClient, sessionId, statusQuery.data?.digest]);
 
   const refresh = useCallback(async () => {
@@ -141,9 +146,9 @@ export function useWorkspaceStatus(sessionId: string | null, enabled: boolean) {
       queryClient.invalidateQueries({
         queryKey: ['code-file-content', sessionId],
       }),
-      statusQuery.refetch(),
+      statusRefetch(),
     ]);
-  }, [queryClient, sessionId, statusQuery]);
+  }, [queryClient, sessionId, statusRefetch]);
 
   return { ...statusQuery, refresh };
 }

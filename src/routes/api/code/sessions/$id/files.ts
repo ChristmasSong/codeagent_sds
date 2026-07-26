@@ -7,8 +7,17 @@ import {
   getWorkspaceStatus,
   listWorkspaceDirectory,
   WorkspaceFilesError,
+  type WorkspaceRuntimeSecretResolver,
 } from '@/modules/code/files';
+import { getAllConfigs } from '@/modules/config/service';
 import { respData, respErr } from '@/lib/resp';
+
+const resolveRuntimeSecret: WorkspaceRuntimeSecretResolver = async (
+  options
+) => {
+  const configs = await getAllConfigs(options);
+  return configs.billing_usage_webhook_secret;
+};
 
 async function currentUser(request: Request) {
   const auth = getAuth();
@@ -37,16 +46,35 @@ async function GET({
     const operation = url.searchParams.get('operation');
     if (operation === 'status') {
       return privateNoStore(
-        respData(await getWorkspaceStatus(user.id, params.id, showHidden))
+        respData(
+          await getWorkspaceStatus(
+            user.id,
+            params.id,
+            showHidden,
+            resolveRuntimeSecret
+          )
+        )
       );
     }
     if (operation === 'content') {
       const path = url.searchParams.get('path') || '';
       if (url.searchParams.get('raw') === 'true') {
-        return getWorkspaceFileRawResponse(user.id, params.id, path);
+        return getWorkspaceFileRawResponse(
+          user.id,
+          params.id,
+          path,
+          resolveRuntimeSecret
+        );
       }
       return privateNoStore(
-        respData(await getWorkspaceFileContent(user.id, params.id, path))
+        respData(
+          await getWorkspaceFileContent(
+            user.id,
+            params.id,
+            path,
+            resolveRuntimeSecret
+          )
+        )
       );
     }
     return privateNoStore(
@@ -55,7 +83,8 @@ async function GET({
           user.id,
           params.id,
           url.searchParams.get('path') || '',
-          showHidden
+          showHidden,
+          resolveRuntimeSecret
         )
       )
     );

@@ -29,6 +29,7 @@ import {
   Square,
   Terminal,
 } from 'lucide-react';
+import { toast } from 'sonner';
 
 import '@xterm/xterm/css/xterm.css';
 
@@ -127,6 +128,8 @@ const EXPANDED_SESSIONS_WIDTH = 240;
 const COLLAPSED_SESSIONS_WIDTH = 56;
 const MIN_TERMINAL_WIDTH = 420;
 const CODE_SIDEBAR_COLLAPSED_KEY = 'hicode:code-sidebar-collapsed';
+const SIDEBAR_TRANSITION_MS = 200;
+const WIDE_WORKBENCH_MEDIA_QUERY = '(min-width: 80rem)';
 
 function workspaceWidthLimit(
   workbench: HTMLDivElement | null,
@@ -137,7 +140,7 @@ function workspaceWidthLimit(
     ? COLLAPSED_SESSIONS_WIDTH
     : EXPANDED_SESSIONS_WIDTH;
   const availableWidth =
-    workbench.getBoundingClientRect().width - sidebarWidth - MIN_TERMINAL_WIDTH;
+    workbench.clientWidth - sidebarWidth - MIN_TERMINAL_WIDTH;
   return Math.min(
     MAX_WORKSPACE_WIDTH,
     Math.max(MIN_WORKSPACE_WIDTH, availableWidth)
@@ -198,14 +201,18 @@ function CodeWorkspacePage() {
     useState<WorkbenchPane>('terminal');
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('files');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarTransitioning, setSidebarTransitioning] = useState(false);
   const [isWideWorkbench, setIsWideWorkbench] = useState(false);
   const [workspaceWidth, setWorkspaceWidth] = useState(440);
+  const [workspaceMaxWidth, setWorkspaceMaxWidth] =
+    useState(MAX_WORKSPACE_WIDTH);
   const [fileTreePercent, setFileTreePercent] = useState(34);
   const [selectedFile, setSelectedFile] = useState<WorkspaceFileEntry | null>(
     null
   );
   const workbenchRef = useRef<HTMLDivElement | null>(null);
   const workspaceFilesRef = useRef<HTMLDivElement | null>(null);
+  const sidebarTransitionTimerRef = useRef<number | null>(null);
   const workspaceResizeRef = useRef<{
     pointerId: number;
     startX: number;
@@ -253,12 +260,14 @@ function CodeWorkspacePage() {
     sessionId && sessionRestoreReady && currentSession?.status === 'active'
       ? sessionId
       : null;
+  const terminalVisible = isWideWorkbench || activeWorkbenchPane === 'terminal';
   const workspaceVisible =
     isWideWorkbench || activeWorkbenchPane === 'workspace';
   const filesPanelVisible = workspaceVisible && workspaceTab === 'files';
-  const fixedWorkbenchWidth =
-    (sidebarCollapsed ? COLLAPSED_SESSIONS_WIDTH : EXPANDED_SESSIONS_WIDTH) +
-    MIN_TERMINAL_WIDTH;
+  const effectiveWorkspaceWidth = Math.min(
+    workspaceMaxWidth,
+    Math.max(MIN_WORKSPACE_WIDTH, workspaceWidth)
+  );
   const billingSuspended =
     currentSession?.status === 'suspended' &&
     currentSession.suspensionReason === 'insufficient_credits';
@@ -420,7 +429,7 @@ function CodeWorkspacePage() {
   }, []);
 
   useEffect(() => {
-    const media = window.matchMedia('(min-width: 1280px)');
+    const media = window.matchMedia(WIDE_WORKBENCH_MEDIA_QUERY);
     const update = () => setIsWideWorkbench(media.matches);
     update();
     media.addEventListener('change', update);
@@ -428,15 +437,47 @@ function CodeWorkspacePage() {
   }, []);
 
   useEffect(() => {
+    if (!isWideWorkbench) {
+      setWorkspaceMaxWidth(MAX_WORKSPACE_WIDTH);
+      return;
+    }
+    const workbench = workbenchRef.current;
+    if (!workbench) return;
+
+    const updateLimit = () => {
+      const nextMaxWidth = workspaceWidthLimit(workbench, sidebarCollapsed);
+      setWorkspaceMaxWidth(nextMaxWidth);
+      setWorkspaceWidth((width) =>
+        Math.min(nextMaxWidth, Math.max(MIN_WORKSPACE_WIDTH, width))
+      );
+    };
+    updateLimit();
+
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(updateLimit);
+    observer.observe(workbench);
+    return () => observer.disconnect();
+  }, [isWideWorkbench, sidebarCollapsed]);
+
+  useEffect(() => {
+    if (!terminalVisible) return;
     const timer = window.setTimeout(resizeTerminal, 220);
     return () => window.clearTimeout(timer);
   }, [
-    activeWorkbenchPane,
-    isWideWorkbench,
+    effectiveWorkspaceWidth,
     resizeTerminal,
     sidebarCollapsed,
-    workspaceWidth,
+    terminalVisible,
   ]);
+
+  useEffect(
+    () => () => {
+      if (sidebarTransitionTimerRef.current !== null) {
+        window.clearTimeout(sidebarTransitionTimerRef.current);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     setRuntimeIssue('');
@@ -605,11 +646,42 @@ function CodeWorkspacePage() {
     terminalSessionId,
   ]);
 
+  const persistSidebarCollapsed = (collapsed: boolean) => {
+    try {
+      window.localStorage.setItem(
+        CODE_SIDEBAR_COLLAPSED_KEY,
+        String(collapsed)
+      );
+    } catch {
+      // The layout still works when storage is unavailable.
+    }
+  };
+
+  const startSidebarTransition = () => {
+    if (!window.matchMedia(WIDE_WORKBENCH_MEDIA_QUERY).matches) return;
+    if (sidebarTransitionTimerRef.current !== null) {
+      window.clearTimeout(sidebarTransitionTimerRef.current);
+    }
+    setSidebarTransitioning(true);
+    sidebarTransitionTimerRef.current = window.setTimeout(() => {
+      sidebarTransitionTimerRef.current = null;
+      setSidebarTransitioning(false);
+    }, SIDEBAR_TRANSITION_MS);
+  };
+
+  const revealSidebarFeedback = () => {
+    if (!window.matchMedia(WIDE_WORKBENCH_MEDIA_QUERY).matches) return;
+    startSidebarTransition();
+    setSidebarCollapsed(false);
+    persistSidebarCollapsed(false);
+  };
+
   const newSession = async (
     currentAction: 'suspend' | 'discard' = 'suspend'
   ) => {
     if (!canCreateSession) {
       setNewSessionMsg(m['code.model.configure_required']());
+      revealSidebarFeedback();
       return;
     }
     setBusyAction('new');
@@ -653,10 +725,15 @@ function CodeWorkspacePage() {
           ? `${message} - ${m['code.actions.cleanup_warning']()}`
           : message
       );
+      if (cleanupErrors.length) {
+        toast.warning(m['code.actions.cleanup_warning']());
+        revealSidebarFeedback();
+      }
     } catch (err) {
       const issue = sessionStartIssueFromError(err);
       setNewSessionIssue(issue);
       setNewSessionMsg(issue ? '' : (err as Error).message || 'error');
+      revealSidebarFeedback();
     } finally {
       setBusyAction('');
     }
@@ -836,16 +913,21 @@ function CodeWorkspacePage() {
   const beginWorkspaceResize = (
     event: ReactPointerEvent<HTMLButtonElement>
   ) => {
-    if (!window.matchMedia('(min-width: 1280px)').matches) return;
+    if (!window.matchMedia(WIDE_WORKBENCH_MEDIA_QUERY).matches) return;
     if (workspaceResizeRef.current || fileTreeResizeRef.current) return;
     event.preventDefault();
+    if (sidebarTransitionTimerRef.current !== null) {
+      window.clearTimeout(sidebarTransitionTimerRef.current);
+      sidebarTransitionTimerRef.current = null;
+      setSidebarTransitioning(false);
+    }
     event.currentTarget.setPointerCapture(event.pointerId);
     workspaceResizeRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startWidth:
         event.currentTarget.parentElement?.getBoundingClientRect().width ??
-        workspaceWidth,
+        effectiveWorkspaceWidth,
       previousCursor: document.body.style.cursor,
       previousUserSelect: document.body.style.userSelect,
     };
@@ -882,7 +964,7 @@ function CodeWorkspacePage() {
   const resizeWorkspaceWithKeyboard = (
     event: ReactKeyboardEvent<HTMLButtonElement>
   ) => {
-    let nextWidth = workspaceWidth;
+    let nextWidth = effectiveWorkspaceWidth;
     if (event.key === 'ArrowLeft') nextWidth += 24;
     else if (event.key === 'ArrowRight') nextWidth -= 24;
     else if (event.key === 'Home') nextWidth = MIN_WORKSPACE_WIDTH;
@@ -988,13 +1070,10 @@ function CodeWorkspacePage() {
   };
 
   const toggleSidebar = () => {
+    startSidebarTransition();
     setSidebarCollapsed((collapsed) => {
       const next = !collapsed;
-      try {
-        window.localStorage.setItem(CODE_SIDEBAR_COLLAPSED_KEY, String(next));
-      } catch {
-        // The layout still works when storage is unavailable.
-      }
+      persistSidebarCollapsed(next);
       return next;
     });
   };
@@ -1096,14 +1175,16 @@ function CodeWorkspacePage() {
         <div
           ref={workbenchRef}
           className={cn(
-            'border-border bg-card grid min-h-0 flex-1 grid-cols-1 overflow-hidden rounded-lg border transition-[grid-template-columns] duration-200',
+            'border-border bg-card grid min-h-0 flex-1 grid-cols-1 overflow-hidden rounded-lg border',
             sidebarCollapsed
               ? 'xl:grid-cols-[56px_minmax(420px,1fr)_var(--workspace-width)]'
-              : 'xl:grid-cols-[240px_minmax(420px,1fr)_var(--workspace-width)]'
+              : 'xl:grid-cols-[240px_minmax(420px,1fr)_var(--workspace-width)]',
+            sidebarTransitioning &&
+              'transition-[grid-template-columns] duration-200 motion-reduce:transition-none'
           )}
           style={
             {
-              '--workspace-width': `min(${workspaceWidth}px, calc(100% - ${fixedWorkbenchWidth}px))`,
+              '--workspace-width': `${effectiveWorkspaceWidth}px`,
             } as CSSProperties
           }
         >
@@ -1566,8 +1647,8 @@ function CodeWorkspacePage() {
               aria-orientation="vertical"
               aria-label={`${m['code.terminal.title']()} / ${m['code.files.title']()}`}
               aria-valuemin={MIN_WORKSPACE_WIDTH}
-              aria-valuemax={MAX_WORKSPACE_WIDTH}
-              aria-valuenow={Math.round(workspaceWidth)}
+              aria-valuemax={Math.round(workspaceMaxWidth)}
+              aria-valuenow={Math.round(effectiveWorkspaceWidth)}
               className="group absolute inset-y-0 -left-1 z-20 hidden w-2 cursor-col-resize touch-none focus-visible:outline-none xl:block"
               onPointerDown={beginWorkspaceResize}
               onPointerMove={resizeWorkspace}
@@ -1633,7 +1714,7 @@ function CodeWorkspacePage() {
                 </Button>
               </div>
               <span className="text-muted-foreground hidden shrink-0 font-mono text-[10px] 2xl:inline">
-                {Math.round(workspaceWidth)}px
+                {Math.round(effectiveWorkspaceWidth)}px
               </span>
             </div>
 
