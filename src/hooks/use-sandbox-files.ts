@@ -2,10 +2,15 @@ import { useCallback, useEffect, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { apiGet } from '@/lib/api-client';
-import type {
-  WorkspaceDirectoryResult,
-  WorkspaceFileContentResult,
-  WorkspaceStatusResult,
+import {
+  nextWorkspaceStatusPollState,
+  shouldConfirmWorkspaceStatus,
+  workspaceStatusPollInterval,
+  type WorkspaceDirectoryResult,
+  type WorkspaceFileContentResult,
+  type WorkspaceStatusPollState,
+  type WorkspaceStatusPollTarget,
+  type WorkspaceStatusResult,
 } from '@/lib/code-files';
 
 function filesEndpoint(sessionId: string, params: Record<string, string> = {}) {
@@ -63,32 +68,65 @@ export function sandboxFileRawUrl(
 
 export function useWorkspaceStatus(sessionId: string | null, enabled: boolean) {
   const queryClient = useQueryClient();
-  const previousDigest = useRef<string | null | undefined>(undefined);
+  const previousDigests = useRef(new Map<string, string | null>());
+  const pollStates = useRef(new Map<string, WorkspaceStatusPollState>());
+  const previousTarget = useRef<WorkspaceStatusPollTarget>({
+    sessionId: null,
+    enabled: false,
+  });
   const statusQuery = useQuery({
     queryKey: ['code-workspace-status', sessionId],
-    queryFn: () =>
-      apiGet<WorkspaceStatusResult>(
+    queryFn: async () => {
+      const result = await apiGet<WorkspaceStatusResult>(
         filesEndpoint(sessionId!, { operation: 'status' })
-      ),
+      );
+      pollStates.current.set(
+        sessionId!,
+        nextWorkspaceStatusPollState(
+          pollStates.current.get(sessionId!),
+          sessionId!,
+          result
+        )
+      );
+      return result;
+    },
     enabled: Boolean(sessionId && enabled),
     refetchInterval: (query) => {
       const data = query.state.data;
-      return data?.sessionStatus && data.sessionStatus !== 'active'
-        ? false
-        : 3_000;
+      if (query.state.status === 'error') return 120_000;
+      if (data?.sessionStatus && data.sessionStatus !== 'active') {
+        return 120_000;
+      }
+      const stableChecks = sessionId
+        ? (pollStates.current.get(sessionId)?.stableChecks ?? 0)
+        : 0;
+      return workspaceStatusPollInterval(stableChecks);
     },
     refetchIntervalInBackground: false,
+    staleTime: 10_000,
     retry: 1,
   });
 
+  const statusRefetch = statusQuery.refetch;
+  useEffect(() => {
+    const nextTarget = {
+      sessionId,
+      enabled: Boolean(sessionId && enabled),
+    };
+    const previous = previousTarget.current;
+    previousTarget.current = nextTarget;
+
+    const shouldConfirm = shouldConfirmWorkspaceStatus(previous, nextTarget);
+    if (shouldConfirm && statusQuery.fetchStatus !== 'fetching') {
+      void statusRefetch();
+    }
+  }, [enabled, sessionId, statusQuery.fetchStatus, statusRefetch]);
+
   useEffect(() => {
     const digest = statusQuery.data?.digest;
-    if (digest === undefined) return;
-    if (
-      previousDigest.current !== undefined &&
-      previousDigest.current !== digest &&
-      sessionId
-    ) {
+    if (digest === undefined || !sessionId) return;
+    const previousDigest = previousDigests.current.get(sessionId);
+    if (previousDigest !== undefined && previousDigest !== digest) {
       void queryClient.invalidateQueries({
         queryKey: ['code-files', sessionId],
       });
@@ -96,12 +134,8 @@ export function useWorkspaceStatus(sessionId: string | null, enabled: boolean) {
         queryKey: ['code-file-content', sessionId],
       });
     }
-    previousDigest.current = digest;
+    previousDigests.current.set(sessionId, digest);
   }, [queryClient, sessionId, statusQuery.data?.digest]);
-
-  useEffect(() => {
-    previousDigest.current = undefined;
-  }, [sessionId]);
 
   const refresh = useCallback(async () => {
     if (!sessionId) return;
@@ -112,9 +146,9 @@ export function useWorkspaceStatus(sessionId: string | null, enabled: boolean) {
       queryClient.invalidateQueries({
         queryKey: ['code-file-content', sessionId],
       }),
-      statusQuery.refetch(),
+      statusRefetch(),
     ]);
-  }, [queryClient, sessionId, statusQuery]);
+  }, [queryClient, sessionId, statusRefetch]);
 
   return { ...statusQuery, refresh };
 }

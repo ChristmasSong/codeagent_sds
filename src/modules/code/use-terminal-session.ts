@@ -129,25 +129,36 @@ export function useTerminalSession({
     [agent, model, runtimeBase, runtimeUserId]
   );
 
-  const sendResize = useCallback((redraw = false) => {
-    const term = termRef.current;
-    const fit = fitRef.current;
-    const socket = socketRef.current;
-    if (!term || !fit) return;
-    try {
-      fit.fit();
-    } catch {
-      return;
-    }
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(
-        JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })
-      );
-      if (redraw) {
-        socket.send(JSON.stringify({ type: 'input', data: '\x0c' }));
+  const sendResize = useCallback(
+    (redraw = false) => {
+      const term = termRef.current;
+      const fit = fitRef.current;
+      const socket = socketRef.current;
+      if (
+        !term ||
+        !fit ||
+        !container ||
+        container.clientWidth <= 0 ||
+        container.clientHeight <= 0
+      ) {
+        return;
       }
-    }
-  }, []);
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(
+          JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })
+        );
+        if (redraw) {
+          socket.send(JSON.stringify({ type: 'input', data: '\x0c' }));
+        }
+      }
+    },
+    [container]
+  );
 
   const queueResize = useCallback(
     (delayMs: number, redraw = false) => {
@@ -164,6 +175,8 @@ export function useTerminalSession({
 
   const scheduleResizeBurst = useCallback(
     (redraw = false) => {
+      resizeTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      resizeTimersRef.current = [];
       [0, 80, 250, 600, 1200].forEach((delayMs, index) => {
         queueResize(delayMs, redraw && index >= 2);
       });

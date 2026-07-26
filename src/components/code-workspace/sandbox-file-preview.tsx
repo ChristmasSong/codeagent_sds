@@ -40,6 +40,7 @@ export interface SandboxFilePreviewLabels {
 interface SandboxFilePreviewProps {
   sessionId: string | null;
   sessionStatus?: string;
+  visible?: boolean;
   file: WorkspaceFileEntry | null;
   labels: SandboxFilePreviewLabels;
 }
@@ -47,10 +48,11 @@ interface SandboxFilePreviewProps {
 export function SandboxFilePreview({
   sessionId,
   sessionStatus = 'active',
+  visible = true,
   file,
   labels,
 }: SandboxFilePreviewProps) {
-  const active = Boolean(sessionId && sessionStatus === 'active');
+  const active = Boolean(sessionId && sessionStatus === 'active' && visible);
   const content = useSandboxFileContent(
     sessionId,
     file?.path || '',

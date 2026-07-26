@@ -69,6 +69,10 @@ const FORWARDED_RAW_HEADERS = [
   'x-file-size',
 ] as const;
 
+export type WorkspaceRuntimeSecretResolver = (options?: {
+  fresh?: boolean;
+}) => Promise<string | null | undefined>;
+
 export class WorkspaceFilesError extends Error {
   constructor(
     message: string,
@@ -164,21 +168,67 @@ async function readRuntimeJson<T>(response: Response): Promise<T> {
   }
 }
 
-async function runtimeFilesRequest<T>(url: string, secret: string): Promise<T> {
-  let response: Response;
+async function runtimeSecret(
+  resolveSecret: WorkspaceRuntimeSecretResolver,
+  fresh = false
+): Promise<string> {
+  let secret = (await resolveSecret({ fresh }))?.trim() || '';
+  // A warm isolate can cache "not configured" before an admin saves the key.
+  if (!secret && !fresh) {
+    secret = (await resolveSecret({ fresh: true }))?.trim() || '';
+  }
+  if (!secret) throw new WorkspaceFilesError('runtime_not_configured', 503);
+  return secret;
+}
+
+export async function requestRuntimeWithSecret(
+  url: string,
+  resolveSecret: WorkspaceRuntimeSecretResolver,
+  timeoutMs: number,
+  headers?: HeadersInit
+): Promise<Response> {
+  const request = async (secret: string) => {
+    const requestHeaders = new Headers(headers);
+    requestHeaders.set('x-hicode-runtime-secret', secret);
+    try {
+      return await fetch(url, {
+        method: 'GET',
+        headers: requestHeaders,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (error) {
+      throw runtimeError(error);
+    }
+  };
+
+  let response = await request(await runtimeSecret(resolveSecret));
+  if (response.status !== 401) return response;
+
+  // The Runtime uses 401 specifically for a stale/mismatched shared secret.
+  await response.body?.cancel().catch(() => undefined);
+  response = await request(await runtimeSecret(resolveSecret, true));
+  if (response.status === 401) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new WorkspaceFilesError('runtime_not_configured', 503);
+  }
+  return response;
+}
+
+async function runtimeFilesRequest<T>(
+  url: string,
+  resolveSecret: WorkspaceRuntimeSecretResolver
+): Promise<T> {
   let payload: T & {
     ok?: boolean;
     error?: string;
   };
+  const response = await requestRuntimeWithSecret(
+    url,
+    resolveSecret,
+    RUNTIME_FILES_TIMEOUT_MS,
+    { accept: 'application/json' }
+  );
   try {
-    response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        accept: 'application/json',
-        'x-hicode-runtime-secret': secret,
-      },
-      signal: AbortSignal.timeout(RUNTIME_FILES_TIMEOUT_MS),
-    });
     payload = await readRuntimeJson<T & { ok?: boolean; error?: string }>(
       response
     );
@@ -193,18 +243,13 @@ async function runtimeFilesRequest<T>(url: string, secret: string): Promise<T> {
 
 async function runtimeFileResponse(
   url: string,
-  secret: string
+  resolveSecret: WorkspaceRuntimeSecretResolver
 ): Promise<Response> {
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: 'GET',
-      headers: { 'x-hicode-runtime-secret': secret },
-      signal: AbortSignal.timeout(RUNTIME_FILE_STREAM_TIMEOUT_MS),
-    });
-  } catch (error) {
-    throw runtimeError(error);
-  }
+  const response = await requestRuntimeWithSecret(
+    url,
+    resolveSecret,
+    RUNTIME_FILE_STREAM_TIMEOUT_MS
+  );
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as {
       error?: string;
@@ -218,12 +263,6 @@ async function ownedActiveSession(userId: string, sessionId: string) {
   const session = await getOwnedSession(userId, sessionId);
   if (!session) throw new WorkspaceFilesError('session_not_found', 404);
   return session;
-}
-
-async function runtimeSecret(): Promise<string> {
-  const secret = envConfigs.billing_usage_webhook_secret?.trim() || '';
-  if (!secret) throw new WorkspaceFilesError('runtime_not_configured', 503);
-  return secret;
 }
 
 function contentUrl(
@@ -256,7 +295,8 @@ export async function listWorkspaceDirectory(
   userId: string,
   sessionId: string,
   requestedPath: unknown,
-  showHidden = false
+  showHidden: boolean,
+  resolveSecret: WorkspaceRuntimeSecretResolver
 ): Promise<WorkspaceDirectoryResult> {
   const session = await ownedActiveSession(userId, sessionId);
   const path = normalizeWorkspacePath(requestedPath);
@@ -281,7 +321,7 @@ export async function listWorkspaceDirectory(
   if (showHidden) url.searchParams.set('showHidden', 'true');
   const payload = await runtimeFilesRequest<RuntimeDirectoryPayload>(
     url.toString(),
-    await runtimeSecret()
+    resolveSecret
   );
   return {
     sessionStatus: session.status,
@@ -295,7 +335,8 @@ export async function listWorkspaceDirectory(
 export async function getWorkspaceStatus(
   userId: string,
   sessionId: string,
-  showHidden = false
+  showHidden: boolean,
+  resolveSecret: WorkspaceRuntimeSecretResolver
 ): Promise<WorkspaceStatusResult> {
   const session = await ownedActiveSession(userId, sessionId);
   if (session.status !== 'active') {
@@ -319,7 +360,7 @@ export async function getWorkspaceStatus(
   if (showHidden) url.searchParams.set('showHidden', 'true');
   const payload = await runtimeFilesRequest<RuntimeStatusPayload>(
     url.toString(),
-    await runtimeSecret()
+    resolveSecret
   );
   return {
     sessionStatus: session.status,
@@ -333,7 +374,8 @@ export async function getWorkspaceStatus(
 export async function getWorkspaceFileContent(
   userId: string,
   sessionId: string,
-  requestedPath: unknown
+  requestedPath: unknown,
+  resolveSecret: WorkspaceRuntimeSecretResolver
 ): Promise<WorkspaceFileContentResult> {
   const session = await ownedActiveSession(userId, sessionId);
   const path = normalizeWorkspacePath(requestedPath);
@@ -349,7 +391,7 @@ export async function getWorkspaceFileContent(
       session.id,
       path
     ).toString(),
-    await runtimeSecret()
+    resolveSecret
   );
   const kind = payload.kind || 'binary';
   return {
@@ -382,7 +424,8 @@ export async function getWorkspaceFileContent(
 export async function getWorkspaceFileRawResponse(
   userId: string,
   sessionId: string,
-  requestedPath: unknown
+  requestedPath: unknown,
+  resolveSecret: WorkspaceRuntimeSecretResolver
 ): Promise<Response> {
   const session = await ownedActiveSession(userId, sessionId);
   const path = normalizeWorkspacePath(requestedPath);
@@ -399,7 +442,7 @@ export async function getWorkspaceFileRawResponse(
       path,
       true
     ).toString(),
-    await runtimeSecret()
+    resolveSecret
   );
   const kind = response.headers.get(
     'x-file-preview-kind'

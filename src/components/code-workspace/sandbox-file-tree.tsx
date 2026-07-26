@@ -29,6 +29,7 @@ export interface SandboxFileTreeLabels {
 interface SandboxFileTreeProps {
   sessionId: string | null;
   sessionStatus?: string;
+  visible?: boolean;
   selectedPath?: string;
   onFileSelect?: (entry: WorkspaceFileEntry) => void;
   labels: SandboxFileTreeLabels;
@@ -37,15 +38,17 @@ interface SandboxFileTreeProps {
 export function SandboxFileTree({
   sessionId,
   sessionStatus = 'active',
+  visible = true,
   selectedPath = '',
   onFileSelect,
   labels,
 }: SandboxFileTreeProps) {
   const isActive = Boolean(sessionId && sessionStatus === 'active');
-  const workspaceStatus = useWorkspaceStatus(sessionId, isActive);
+  const workspaceStatus = useWorkspaceStatus(sessionId, isActive && visible);
   const effectiveStatus =
     workspaceStatus.data?.sessionStatus || sessionStatus || 'active';
-  const canRead = isActive && effectiveStatus === 'active';
+  const canRead = isActive && visible && effectiveStatus === 'active';
+  const canRefresh = isActive && visible;
   const root = useSandboxDirectory(sessionId, '', canRead);
 
   return (
@@ -59,7 +62,7 @@ export function SandboxFileTree({
           className="text-muted-foreground hover:bg-muted hover:text-foreground inline-flex size-7 shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50"
           aria-label={labels.refresh}
           title={labels.refresh}
-          disabled={!canRead || workspaceStatus.isFetching}
+          disabled={!canRefresh || workspaceStatus.isFetching}
           onClick={() => void workspaceStatus.refresh()}
         >
           <RefreshCw
@@ -72,7 +75,7 @@ export function SandboxFileTree({
       </div>
 
       <div className="border-border bg-background min-h-0 flex-1 overflow-auto rounded-md border py-1">
-        {!sessionId || effectiveStatus !== 'active' ? (
+        {!isActive || effectiveStatus !== 'active' ? (
           <TreeMessage>{labels.inactive}</TreeMessage>
         ) : root.isPending ? (
           <TreeMessage>
@@ -89,6 +92,7 @@ export function SandboxFileTree({
                 entry={entry}
                 level={0}
                 sessionId={sessionId}
+                enabled={canRead}
                 selectedPath={selectedPath}
                 onFileSelect={onFileSelect}
                 labels={labels}
@@ -112,6 +116,7 @@ function FileTreeEntry({
   entry,
   level,
   sessionId,
+  enabled,
   selectedPath,
   onFileSelect,
   labels,
@@ -119,6 +124,7 @@ function FileTreeEntry({
   entry: WorkspaceFileEntry;
   level: number;
   sessionId: string;
+  enabled: boolean;
   selectedPath: string;
   onFileSelect?: (entry: WorkspaceFileEntry) => void;
   labels: SandboxFileTreeLabels;
@@ -128,7 +134,7 @@ function FileTreeEntry({
   const children = useSandboxDirectory(
     sessionId,
     entry.path,
-    isDirectory && expanded
+    enabled && isDirectory && expanded
   );
 
   return (
@@ -195,6 +201,7 @@ function FileTreeEntry({
                 entry={child}
                 level={level + 1}
                 sessionId={sessionId}
+                enabled={enabled}
                 selectedPath={selectedPath}
                 onFileSelect={onFileSelect}
                 labels={labels}
