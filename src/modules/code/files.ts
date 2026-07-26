@@ -1,4 +1,5 @@
 import { envConfigs } from '@/config';
+import { getAllConfigs } from '@/modules/config/service';
 import type {
   WorkspaceDirectoryResult,
   WorkspaceFileContentResult,
@@ -221,7 +222,8 @@ async function ownedActiveSession(userId: string, sessionId: string) {
 }
 
 async function runtimeSecret(): Promise<string> {
-  const secret = envConfigs.billing_usage_webhook_secret?.trim() || '';
+  const configs = await getAllConfigs();
+  const secret = configs.billing_usage_webhook_secret?.trim() || '';
   if (!secret) throw new WorkspaceFilesError('runtime_not_configured', 503);
   return secret;
 }

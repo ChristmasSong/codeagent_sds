@@ -29,6 +29,7 @@ export interface SandboxFileTreeLabels {
 interface SandboxFileTreeProps {
   sessionId: string | null;
   sessionStatus?: string;
+  visible?: boolean;
   selectedPath?: string;
   onFileSelect?: (entry: WorkspaceFileEntry) => void;
   labels: SandboxFileTreeLabels;
@@ -37,15 +38,16 @@ interface SandboxFileTreeProps {
 export function SandboxFileTree({
   sessionId,
   sessionStatus = 'active',
+  visible = true,
   selectedPath = '',
   onFileSelect,
   labels,
 }: SandboxFileTreeProps) {
   const isActive = Boolean(sessionId && sessionStatus === 'active');
-  const workspaceStatus = useWorkspaceStatus(sessionId, isActive);
+  const workspaceStatus = useWorkspaceStatus(sessionId, isActive && visible);
   const effectiveStatus =
     workspaceStatus.data?.sessionStatus || sessionStatus || 'active';
-  const canRead = isActive && effectiveStatus === 'active';
+  const canRead = isActive && visible && effectiveStatus === 'active';
   const root = useSandboxDirectory(sessionId, '', canRead);
 
   return (
@@ -89,6 +91,7 @@ export function SandboxFileTree({
                 entry={entry}
                 level={0}
                 sessionId={sessionId}
+                enabled={canRead}
                 selectedPath={selectedPath}
                 onFileSelect={onFileSelect}
                 labels={labels}
@@ -112,6 +115,7 @@ function FileTreeEntry({
   entry,
   level,
   sessionId,
+  enabled,
   selectedPath,
   onFileSelect,
   labels,
@@ -119,6 +123,7 @@ function FileTreeEntry({
   entry: WorkspaceFileEntry;
   level: number;
   sessionId: string;
+  enabled: boolean;
   selectedPath: string;
   onFileSelect?: (entry: WorkspaceFileEntry) => void;
   labels: SandboxFileTreeLabels;
@@ -128,7 +133,7 @@ function FileTreeEntry({
   const children = useSandboxDirectory(
     sessionId,
     entry.path,
-    isDirectory && expanded
+    enabled && isDirectory && expanded
   );
 
   return (
@@ -195,6 +200,7 @@ function FileTreeEntry({
                 entry={child}
                 level={level + 1}
                 sessionId={sessionId}
+                enabled={enabled}
                 selectedPath={selectedPath}
                 onFileSelect={onFileSelect}
                 labels={labels}

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 
+import { workspaceStatusPollInterval } from '../../lib/code-files';
 import {
   actionUrl,
   generateSessionId,
@@ -132,5 +133,14 @@ assert.equal(
   workspaceFilesUrl('https://rt.example.dev/', 'u 1', 's/1', 'content'),
   'https://rt.example.dev/files/u%201/s%2F1/content'
 );
+
+// Workspace scans back off while the digest stays stable.
+assert.equal(workspaceStatusPollInterval(0), 15_000);
+assert.equal(workspaceStatusPollInterval(1), 15_000);
+assert.equal(workspaceStatusPollInterval(2), 30_000);
+assert.equal(workspaceStatusPollInterval(4), 30_000);
+assert.equal(workspaceStatusPollInterval(5), 60_000);
+assert.equal(workspaceStatusPollInterval(9), 60_000);
+assert.equal(workspaceStatusPollInterval(10), 120_000);
 
 console.log('runtime.test.ts OK');

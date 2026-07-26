@@ -25,6 +25,13 @@ export interface WorkspaceStatusResult {
   truncated: boolean;
 }
 
+export function workspaceStatusPollInterval(stableChecks: number): number {
+  if (stableChecks >= 10) return 120_000;
+  if (stableChecks >= 5) return 60_000;
+  if (stableChecks >= 2) return 30_000;
+  return 15_000;
+}
+
 export type WorkspaceFilePreviewKind =
   | 'text'
   | 'markdown'

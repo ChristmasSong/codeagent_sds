@@ -22,6 +22,8 @@ import {
   Focus,
   FolderTree,
   History,
+  PanelLeftClose,
+  PanelLeftOpen,
   Play,
   Plus,
   Square,
@@ -121,10 +123,21 @@ const MIN_WORKSPACE_WIDTH = 360;
 const MAX_WORKSPACE_WIDTH = 640;
 const MIN_FILE_TREE_PERCENT = 22;
 const MAX_FILE_TREE_PERCENT = 62;
+const EXPANDED_SESSIONS_WIDTH = 240;
+const COLLAPSED_SESSIONS_WIDTH = 56;
+const MIN_TERMINAL_WIDTH = 420;
+const CODE_SIDEBAR_COLLAPSED_KEY = 'hicode:code-sidebar-collapsed';
 
-function workspaceWidthLimit(workbench: HTMLDivElement | null) {
+function workspaceWidthLimit(
+  workbench: HTMLDivElement | null,
+  sidebarCollapsed = false
+) {
   if (!workbench) return MAX_WORKSPACE_WIDTH;
-  const availableWidth = workbench.getBoundingClientRect().width - 240 - 420;
+  const sidebarWidth = sidebarCollapsed
+    ? COLLAPSED_SESSIONS_WIDTH
+    : EXPANDED_SESSIONS_WIDTH;
+  const availableWidth =
+    workbench.getBoundingClientRect().width - sidebarWidth - MIN_TERMINAL_WIDTH;
   return Math.min(
     MAX_WORKSPACE_WIDTH,
     Math.max(MIN_WORKSPACE_WIDTH, availableWidth)
@@ -184,6 +197,8 @@ function CodeWorkspacePage() {
   const [activeWorkbenchPane, setActiveWorkbenchPane] =
     useState<WorkbenchPane>('terminal');
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('files');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [isWideWorkbench, setIsWideWorkbench] = useState(false);
   const [workspaceWidth, setWorkspaceWidth] = useState(440);
   const [fileTreePercent, setFileTreePercent] = useState(34);
   const [selectedFile, setSelectedFile] = useState<WorkspaceFileEntry | null>(
@@ -238,6 +253,12 @@ function CodeWorkspacePage() {
     sessionId && sessionRestoreReady && currentSession?.status === 'active'
       ? sessionId
       : null;
+  const workspaceVisible =
+    isWideWorkbench || activeWorkbenchPane === 'workspace';
+  const filesPanelVisible = workspaceVisible && workspaceTab === 'files';
+  const fixedWorkbenchWidth =
+    (sidebarCollapsed ? COLLAPSED_SESSIONS_WIDTH : EXPANDED_SESSIONS_WIDTH) +
+    MIN_TERMINAL_WIDTH;
   const billingSuspended =
     currentSession?.status === 'suspended' &&
     currentSession.suspensionReason === 'insufficient_credits';
@@ -366,6 +387,7 @@ function CodeWorkspacePage() {
     focused,
     mode,
     reconnect,
+    resize: resizeTerminal,
     focus: focusTerminal,
     interrupt,
     scrollToBottom,
@@ -386,6 +408,35 @@ function CodeWorkspacePage() {
     currentSession,
     archiveCheckpoint
   );
+
+  useEffect(() => {
+    try {
+      setSidebarCollapsed(
+        window.localStorage.getItem(CODE_SIDEBAR_COLLAPSED_KEY) === 'true'
+      );
+    } catch {
+      setSidebarCollapsed(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia('(min-width: 1280px)');
+    const update = () => setIsWideWorkbench(media.matches);
+    update();
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(resizeTerminal, 220);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeWorkbenchPane,
+    isWideWorkbench,
+    resizeTerminal,
+    sidebarCollapsed,
+    workspaceWidth,
+  ]);
 
   useEffect(() => {
     setRuntimeIssue('');
@@ -806,7 +857,10 @@ function CodeWorkspacePage() {
     const resize = workspaceResizeRef.current;
     if (!resize || resize.pointerId !== event.pointerId) return;
     const nextWidth = resize.startWidth + (resize.startX - event.clientX);
-    const maxWidth = workspaceWidthLimit(workbenchRef.current);
+    const maxWidth = workspaceWidthLimit(
+      workbenchRef.current,
+      sidebarCollapsed
+    );
     setWorkspaceWidth(
       Math.min(maxWidth, Math.max(MIN_WORKSPACE_WIDTH, nextWidth))
     );
@@ -833,10 +887,13 @@ function CodeWorkspacePage() {
     else if (event.key === 'ArrowRight') nextWidth -= 24;
     else if (event.key === 'Home') nextWidth = MIN_WORKSPACE_WIDTH;
     else if (event.key === 'End')
-      nextWidth = workspaceWidthLimit(workbenchRef.current);
+      nextWidth = workspaceWidthLimit(workbenchRef.current, sidebarCollapsed);
     else return;
     event.preventDefault();
-    const maxWidth = workspaceWidthLimit(workbenchRef.current);
+    const maxWidth = workspaceWidthLimit(
+      workbenchRef.current,
+      sidebarCollapsed
+    );
     setWorkspaceWidth(
       Math.min(maxWidth, Math.max(MIN_WORKSPACE_WIDTH, nextWidth))
     );
@@ -927,6 +984,18 @@ function CodeWorkspacePage() {
     setWorkspaceTab(nextTab);
     window.requestAnimationFrame(() => {
       document.getElementById(`code-workspace-tab-${nextTab}`)?.focus();
+    });
+  };
+
+  const toggleSidebar = () => {
+    setSidebarCollapsed((collapsed) => {
+      const next = !collapsed;
+      try {
+        window.localStorage.setItem(CODE_SIDEBAR_COLLAPSED_KEY, String(next));
+      } catch {
+        // The layout still works when storage is unavailable.
+      }
+      return next;
     });
   };
 
@@ -1026,21 +1095,32 @@ function CodeWorkspacePage() {
 
         <div
           ref={workbenchRef}
-          className="border-border bg-card grid min-h-0 flex-1 grid-cols-1 overflow-hidden rounded-lg border xl:grid-cols-[240px_minmax(420px,1fr)_var(--workspace-width)]"
+          className={cn(
+            'border-border bg-card grid min-h-0 flex-1 grid-cols-1 overflow-hidden rounded-lg border transition-[grid-template-columns] duration-200',
+            sidebarCollapsed
+              ? 'xl:grid-cols-[56px_minmax(420px,1fr)_var(--workspace-width)]'
+              : 'xl:grid-cols-[240px_minmax(420px,1fr)_var(--workspace-width)]'
+          )}
           style={
             {
-              '--workspace-width': `min(${workspaceWidth}px, calc(100% - 660px))`,
+              '--workspace-width': `min(${workspaceWidth}px, calc(100% - ${fixedWorkbenchWidth}px))`,
             } as CSSProperties
           }
         >
           <aside
             className={cn(
               'border-border bg-card min-h-0 flex-col overflow-y-auto p-4 xl:flex xl:border-r',
-              activeWorkbenchPane === 'sessions' ? 'flex' : 'hidden'
+              activeWorkbenchPane === 'sessions' ? 'flex' : 'hidden',
+              sidebarCollapsed && 'xl:p-2'
             )}
           >
-            <div className="flex items-center justify-between">
-              <div>
+            <div
+              className={cn(
+                'flex items-center justify-between',
+                sidebarCollapsed && 'xl:flex-col xl:gap-3'
+              )}
+            >
+              <div className={cn(sidebarCollapsed && 'xl:hidden')}>
                 <p className="text-sm font-semibold">
                   {m['code.sessions.title']()}
                 </p>
@@ -1048,20 +1128,55 @@ function CodeWorkspacePage() {
                   {m['code.sessions.subtitle']()}
                 </p>
               </div>
-              <Button
-                size="icon"
-                className="size-8 rounded-full"
-                aria-label={m['code.sessions.new']()}
-                disabled={
-                  Boolean(busyAction) || restoreInProgress || !canCreateSession
-                }
-                onClick={requestNewSession}
+              <div
+                className={cn(
+                  'flex items-center gap-2',
+                  sidebarCollapsed && 'xl:flex-col'
+                )}
               >
-                <Plus className="size-4" />
-              </Button>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="hidden size-8 xl:inline-flex"
+                  aria-label={
+                    sidebarCollapsed
+                      ? m['code.sidebar.expand']()
+                      : m['code.sidebar.collapse']()
+                  }
+                  title={
+                    sidebarCollapsed
+                      ? m['code.sidebar.expand']()
+                      : m['code.sidebar.collapse']()
+                  }
+                  aria-expanded={!sidebarCollapsed}
+                  onClick={toggleSidebar}
+                >
+                  {sidebarCollapsed ? (
+                    <PanelLeftOpen className="size-4" />
+                  ) : (
+                    <PanelLeftClose className="size-4" />
+                  )}
+                </Button>
+                <Button
+                  size="icon"
+                  className="size-8 rounded-full"
+                  aria-label={m['code.sessions.new']()}
+                  disabled={
+                    Boolean(busyAction) ||
+                    restoreInProgress ||
+                    !canCreateSession
+                  }
+                  onClick={requestNewSession}
+                >
+                  <Plus className="size-4" />
+                </Button>
+              </div>
             </div>
 
-            <div className="mt-5 space-y-2">
+            <div
+              className={cn('mt-5 space-y-2', sidebarCollapsed && 'xl:hidden')}
+            >
               <Label className="text-muted-foreground text-xs">
                 {m['code.agent.new_session']()}
               </Label>
@@ -1087,7 +1202,9 @@ function CodeWorkspacePage() {
               </Select>
             </div>
 
-            <div className="mt-4 space-y-2">
+            <div
+              className={cn('mt-4 space-y-2', sidebarCollapsed && 'xl:hidden')}
+            >
               <Label className="text-muted-foreground text-xs">
                 {m['code.model.new_session']()}
               </Label>
@@ -1117,7 +1234,10 @@ function CodeWorkspacePage() {
             {newSessionMsg && (
               <p
                 aria-live="polite"
-                className="text-muted-foreground mt-3 rounded-md border border-dashed px-3 py-2 text-xs leading-5"
+                className={cn(
+                  'text-muted-foreground mt-3 rounded-md border border-dashed px-3 py-2 text-xs leading-5',
+                  sidebarCollapsed && 'xl:hidden'
+                )}
               >
                 {newSessionMsg}
               </p>
@@ -1126,7 +1246,10 @@ function CodeWorkspacePage() {
             {newSessionIssue && (
               <div
                 role="alert"
-                className="border-destructive/40 bg-destructive/5 mt-3 rounded-md border px-3 py-3 text-xs leading-5"
+                className={cn(
+                  'border-destructive/40 bg-destructive/5 mt-3 rounded-md border px-3 py-3 text-xs leading-5',
+                  sidebarCollapsed && 'xl:hidden'
+                )}
               >
                 <div className="text-destructive flex items-start gap-2 font-medium">
                   <AlertTriangle className="mt-0.5 size-4 shrink-0" />
@@ -1155,7 +1278,9 @@ function CodeWorkspacePage() {
               </div>
             )}
 
-            <div className="mt-6 space-y-2">
+            <div
+              className={cn('mt-6 space-y-2', sidebarCollapsed && 'xl:hidden')}
+            >
               {sessions.length === 0 && (
                 <p className="text-muted-foreground rounded-md border border-dashed px-3 py-2 text-xs">
                   {m['code.sessions.empty']()}
@@ -1200,7 +1325,12 @@ function CodeWorkspacePage() {
               ))}
             </div>
 
-            <div className="border-border mt-6 border-t pt-5">
+            <div
+              className={cn(
+                'border-border mt-6 border-t pt-5',
+                sidebarCollapsed && 'xl:hidden'
+              )}
+            >
               <div className="mb-3 flex items-center gap-2 text-xs font-medium">
                 <History className="text-muted-foreground size-3.5" />
                 {m['code.sessions.archived_title']()}
@@ -1241,7 +1371,12 @@ function CodeWorkspacePage() {
               </div>
             </div>
 
-            <div className="border-border mt-6 rounded-lg border p-3">
+            <div
+              className={cn(
+                'border-border mt-6 rounded-lg border p-3',
+                sidebarCollapsed && 'xl:hidden'
+              )}
+            >
               <div className="mb-3 flex items-center gap-2 text-sm font-medium">
                 <Cloud className="text-primary size-4" />
                 {m['code.runtime.title']()}
@@ -1529,6 +1664,7 @@ function CodeWorkspacePage() {
                     <SandboxFileTree
                       sessionId={sessionId}
                       sessionStatus={currentSession?.status}
+                      visible={filesPanelVisible}
                       selectedPath={selectedFile?.path}
                       onFileSelect={setSelectedFile}
                       labels={{
@@ -1580,6 +1716,7 @@ function CodeWorkspacePage() {
                       key={sessionId || 'no-session'}
                       sessionId={sessionId}
                       sessionStatus={currentSession?.status}
+                      visible={filesPanelVisible}
                       file={selectedFile}
                       labels={{
                         empty: m['code.file_preview.empty'](),
