@@ -6,11 +6,11 @@ import {
   workspaceStatusPollInterval,
 } from '../../lib/code-files';
 import { requestRuntimeWithSecret, WorkspaceFilesError } from './files';
+import { signedPreviewUrl } from './preview-access';
 import {
   actionUrl,
   generateSessionId,
   normalizeAgent,
-  previewUrl,
   sanitizeUserId,
   shouldRestoreWorkspace,
   terminalHttpUrl,
@@ -119,10 +119,17 @@ assert.equal(
   'https://rt.example.dev/clear/u1/s1?agent=codex&model=m1'
 );
 
-// previewUrl
-assert.equal(
-  previewUrl('https://rt.example.dev', 'u1', 's1'),
-  'https://rt.example.dev/preview/u1/s1/'
+const signedPreview = await signedPreviewUrl({
+  runtimeBaseUrl: 'https://rt.example.dev/',
+  runtimeUserId: 'u 1',
+  sessionId: 's/1',
+  secret: 'preview-test-secret',
+  now: 1_700_000_000_000,
+});
+assert.equal(signedPreview.expiresAt, 1_700_000_300);
+assert.match(
+  signedPreview.url,
+  /^https:\/\/rt\.example\.dev\/preview\/u%201\/s%2F1\/1700000300\.[A-Za-z0-9_-]{43}\/$/
 );
 
 // workspaceFilesUrl

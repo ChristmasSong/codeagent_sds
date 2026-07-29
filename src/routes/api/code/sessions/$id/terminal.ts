@@ -4,6 +4,7 @@ import { getAuth } from '@/core/auth';
 import { envConfigs } from '@/config';
 import { normalizeAgent, terminalHttpUrl } from '@/modules/code/runtime';
 import * as codeSessions from '@/modules/code/service';
+import { getAllConfigs } from '@/modules/config/service';
 
 function logProxy(event: string, data: Record<string, unknown> = {}) {
   console.info('[code-terminal-proxy]', { event, ...data });
@@ -14,6 +15,17 @@ async function currentUser(request: Request) {
   const session = await auth.api.getSession({ headers: request.headers });
   if (!session?.user) throw new Error('Unauthorized');
   return session.user;
+}
+
+async function runtimeSecret(fresh = false) {
+  const configs = await getAllConfigs({ fresh });
+  const secret = (
+    configs.billing_usage_webhook_secret ||
+    envConfigs.billing_usage_webhook_secret ||
+    ''
+  ).trim();
+  if (!secret) throw new Error('Runtime terminal proxy is not configured');
+  return secret;
 }
 
 async function GET({
@@ -51,6 +63,7 @@ async function GET({
     const headers = new Headers(request.headers);
     headers.delete('cookie');
     headers.delete('host');
+    headers.set('x-hicode-runtime-secret', await runtimeSecret());
 
     const upstreamUrl = terminalHttpUrl(
       envConfigs.runtime_base_url,
@@ -66,10 +79,18 @@ async function GET({
       runtimeHost: new URL(upstreamUrl).host,
     });
 
-    const upstream = await fetch(upstreamUrl, {
+    let upstream = await fetch(upstreamUrl, {
       method: 'GET',
       headers,
     });
+    if (upstream.status === 401) {
+      await upstream.body?.cancel().catch(() => undefined);
+      headers.set('x-hicode-runtime-secret', await runtimeSecret(true));
+      upstream = await fetch(upstreamUrl, {
+        method: 'GET',
+        headers,
+      });
+    }
     logProxy('upstream-response', {
       sessionId: session.id,
       status: upstream.status,

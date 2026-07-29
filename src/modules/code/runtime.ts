@@ -109,14 +109,6 @@ export function actionUrl(
   return appendSessionParams(parts.join('/'), agent, model);
 }
 
-export function previewUrl(
-  base: string,
-  userId: string,
-  sessionId: string
-): string {
-  return `${trimSlashes(base)}/preview/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}/`;
-}
-
 export function workspaceFilesUrl(
   base: string,
   userId: string,

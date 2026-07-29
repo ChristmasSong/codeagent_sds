@@ -21,6 +21,7 @@ import stat
 import struct
 import subprocess
 import tarfile
+import tempfile
 import termios
 import threading
 import uuid
@@ -65,6 +66,8 @@ ARCHIVE_EXCLUDED_PATHS = {
     (".next", "cache"),
     (".yarn", "cache"),
 }
+ARCHIVE_IO_CHUNK_BYTES = 1024 * 1024
+MAX_SAFE_INTEGER = 9007199254740991
 
 
 class RuntimeOperationError(Exception):
@@ -807,7 +810,7 @@ def write_claude_bootstrap(config_dir: Path, home_dir: Path, cwd: Path, base_url
     helper = config_dir / "codeagent-api-key-helper.sh"
     helper.write_text(
         "#!/bin/sh\n"
-        "printf '%s\\n' \"${CODEAGENT_ANTHROPIC_API_KEY:-mock-key}\"\n",
+        "printf '%s\\n' \"${CODEAGENT_ANTHROPIC_API_KEY:-}\"\n",
         encoding="utf-8",
     )
     helper.chmod(0o700)
@@ -928,7 +931,12 @@ def install_claude_launcher(home_dir: Path, claude_bin: Path):
     launcher.chmod(0o755)
 
 
-def claude_process_env(home_dir: Path, config_dir: Path, base_url: str):
+def claude_process_env(
+    home_dir: Path,
+    config_dir: Path,
+    base_url: str,
+    model_gateway_token: str,
+):
     blocked = {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -939,7 +947,7 @@ def claude_process_env(home_dir: Path, config_dir: Path, base_url: str):
     env.update({
         "HOME": str(home_dir),
         "CLAUDE_CONFIG_DIR": str(config_dir),
-        "CODEAGENT_ANTHROPIC_API_KEY": "mock-key",
+        "CODEAGENT_ANTHROPIC_API_KEY": model_gateway_token,
         "ANTHROPIC_BASE_URL": base_url,
         "PATH": f"{home_dir / '.local' / 'bin'}:{env.get('PATH', '')}",
         "TERM": "xterm-256color",
@@ -1034,7 +1042,12 @@ def maybe_accept_claude_trust_prompt(name: str):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def ensure_claude_tmux(session_id: str, base_url: str, model: str):
+def ensure_claude_tmux(
+    session_id: str,
+    base_url: str,
+    model: str,
+    model_gateway_token: str,
+):
     name = session_name(session_id, "claude")
     cwd = session_path(session_id)
     cwd.mkdir(parents=True, exist_ok=True)
@@ -1064,7 +1077,12 @@ def ensure_claude_tmux(session_id: str, base_url: str, model: str):
     command = f"/bin/sh -lc {shlex.quote(inner_command)}"
     created = subprocess.run([
         "tmux", "new-session", "-d", "-s", name, "-c", str(cwd), command
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=claude_process_env(home_dir, config_dir, base_url), **runtime_subprocess_kwargs())
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=claude_process_env(
+        home_dir,
+        config_dir,
+        base_url,
+        model_gateway_token,
+    ), **runtime_subprocess_kwargs())
     if created.returncode != 0:
         raise RuntimeError(created.stderr or "failed to create claude tmux session")
     configure_tmux_session(name)
@@ -1111,10 +1129,26 @@ def ensure_codex_tmux(session_id: str, openai_api_key: str, model: str, base_url
     return name, cwd
 
 
-def ensure_agent_tmux(session_id: str, base_url: str, agent: str, openai_api_key: str, model: str):
+def ensure_agent_tmux(
+    session_id: str,
+    base_url: str,
+    agent: str,
+    model_gateway_token: str,
+    model: str,
+):
     if safe_agent(agent) == "codex":
-        return ensure_codex_tmux(session_id, openai_api_key, model, base_url)
-    return ensure_claude_tmux(session_id, base_url, model)
+        return ensure_codex_tmux(
+            session_id,
+            model_gateway_token,
+            model,
+            base_url,
+        )
+    return ensure_claude_tmux(
+        session_id,
+        base_url,
+        model,
+        model_gateway_token,
+    )
 
 
 def archive_path_is_excluded(relative: PurePosixPath) -> bool:
@@ -1124,9 +1158,49 @@ def archive_path_is_excluded(relative: PurePosixPath) -> bool:
     return any(parts[: len(prefix)] == prefix for prefix in ARCHIVE_EXCLUDED_PATHS)
 
 
-def snapshot_workspace(root: Path, stage: str = "workspace.scan"):
+def archive_max_bytes(parsed):
+    values = parse_qs(parsed.query, keep_blank_values=True).get("maxBytes")
+    if values is None:
+        return None
+    if len(values) != 1 or not values[0].isdigit():
+        raise RuntimeOperationError(
+            "invalid_archive_max_bytes",
+            "archive.quota",
+            "maxBytes must be a non-negative safe integer",
+            400,
+        )
+    value = int(values[0])
+    if value > MAX_SAFE_INTEGER:
+        raise RuntimeOperationError(
+            "invalid_archive_max_bytes",
+            "archive.quota",
+            "maxBytes must be a non-negative safe integer",
+            400,
+        )
+    return value
+
+
+def archive_size_exceeded(max_bytes: int, actual_bytes: int, path: str = ""):
+    details = {"maxBytes": max_bytes, "actualBytes": actual_bytes}
+    if path:
+        details["path"] = path
+    return RuntimeOperationError(
+        "archive_size_exceeded",
+        "archive.quota",
+        "Workspace archive exceeds the reserved storage capacity",
+        413,
+        details,
+    )
+
+
+def snapshot_workspace(
+    root: Path,
+    stage: str = "workspace.scan",
+    max_bytes: Optional[int] = None,
+):
     entries = []
     skipped = []
+    total_bytes = 0
     if not root.exists():
         return entries, skipped
 
@@ -1159,8 +1233,7 @@ def snapshot_workspace(root: Path, stage: str = "workspace.scan"):
                 skipped.append(relative.as_posix())
                 continue
             try:
-                stat_result = path.stat()
-                data = path.read_bytes()
+                stat_result = os.stat(path, follow_symlinks=False)
             except FileNotFoundError:
                 skipped.append(relative.as_posix())
                 continue
@@ -1171,9 +1244,20 @@ def snapshot_workspace(root: Path, stage: str = "workspace.scan"):
                     f"Failed to read workspace file: {relative.as_posix()}",
                     details={"path": relative.as_posix(), "reason": str(error)},
                 ) from error
+            if not stat.S_ISREG(stat_result.st_mode):
+                skipped.append(relative.as_posix())
+                continue
+            total_bytes += stat_result.st_size
+            if max_bytes is not None and total_bytes > max_bytes:
+                raise archive_size_exceeded(
+                    max_bytes,
+                    total_bytes,
+                    relative.as_posix(),
+                )
             entries.append({
                 "path": relative.as_posix(),
-                "data": data,
+                "source": path,
+                "size": stat_result.st_size,
                 "mode": stat_result.st_mode & 0o777,
                 "mtime": int(stat_result.st_mtime),
             })
@@ -1182,20 +1266,64 @@ def snapshot_workspace(root: Path, stage: str = "workspace.scan"):
     return entries, skipped
 
 
-def manifest_from_entries(session_id: str, entries, skipped=None):
-    files = []
+def hash_workspace_entry(entry, stage: str) -> str:
     digest = hashlib.sha256()
-    for entry in entries:
-        file_sha = sha256_bytes(entry["data"])
-        digest.update(entry["path"].encode())
+    bytes_read = 0
+    try:
+        with entry["source"].open("rb") as source:
+            stat_result = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(stat_result.st_mode)
+                or stat_result.st_size != entry["size"]
+            ):
+                raise RuntimeOperationError(
+                    "workspace_changed_during_scan",
+                    stage,
+                    f"Workspace file changed during scan: {entry['path']}",
+                    409,
+                    {"path": entry["path"]},
+                )
+            while True:
+                chunk = source.read(ARCHIVE_IO_CHUNK_BYTES)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                digest.update(chunk)
+    except RuntimeOperationError:
+        raise
+    except FileNotFoundError:
+        raise RuntimeOperationError(
+            "workspace_changed_during_scan",
+            stage,
+            f"Workspace file disappeared during scan: {entry['path']}",
+            409,
+            {"path": entry["path"]},
+        ) from None
+    except OSError as error:
+        raise RuntimeOperationError(
+            "workspace_file_read_failed",
+            stage,
+            f"Failed to read workspace file: {entry['path']}",
+            details={"path": entry["path"], "reason": str(error)},
+        ) from error
+    if bytes_read != entry["size"]:
+        raise RuntimeOperationError(
+            "workspace_changed_during_scan",
+            stage,
+            f"Workspace file changed during scan: {entry['path']}",
+            409,
+            {"path": entry["path"]},
+        )
+    return digest.hexdigest()
+
+
+def manifest_from_files(session_id: str, files, skipped=None):
+    digest = hashlib.sha256()
+    for file in files:
+        digest.update(file["path"].encode())
         digest.update(b"\0")
-        digest.update(file_sha.encode())
+        digest.update(file["sha256"].encode())
         digest.update(b"\0")
-        files.append({
-            "path": entry["path"],
-            "size": len(entry["data"]),
-            "sha256": file_sha,
-        })
 
     skipped = skipped or []
     return {
@@ -1204,10 +1332,22 @@ def manifest_from_entries(session_id: str, entries, skipped=None):
         "exists": True,
         "digest": digest.hexdigest(),
         "file_count": len(files),
+        "total_bytes": sum(file["size"] for file in files),
         "files": files,
         "skipped_count": len(skipped),
         "skipped_files": skipped[:50],
     }
+
+
+def manifest_from_entries(session_id: str, entries, skipped=None):
+    files = []
+    for entry in entries:
+        files.append({
+            "path": entry["path"],
+            "size": entry["size"],
+            "sha256": hash_workspace_entry(entry, "workspace.inspect"),
+        })
+    return manifest_from_files(session_id, files, skipped)
 
 
 def workspace_manifest_for_root(session_id: str, root: Path):
@@ -1218,6 +1358,7 @@ def workspace_manifest_for_root(session_id: str, root: Path):
             "exists": False,
             "digest": None,
             "file_count": 0,
+            "total_bytes": 0,
             "files": [],
             "skipped_count": 0,
             "skipped_files": [],
@@ -1272,7 +1413,35 @@ fetch("./api/session")
     return workspace_manifest(session_id)
 
 
-def make_archive(session_id: str):
+class DigestingReader:
+    def __init__(self, source):
+        self.source = source
+        self.digest = hashlib.sha256()
+        self.bytes_read = 0
+
+    def read(self, size=-1):
+        chunk = self.source.read(size)
+        self.bytes_read += len(chunk)
+        self.digest.update(chunk)
+        return chunk
+
+    def hexdigest(self):
+        return self.digest.hexdigest()
+
+
+def archive_file_sha256(archive_file) -> str:
+    digest = hashlib.sha256()
+    archive_file.seek(0)
+    while True:
+        chunk = archive_file.read(ARCHIVE_IO_CHUNK_BYTES)
+        if not chunk:
+            break
+        digest.update(chunk)
+    archive_file.seek(0)
+    return digest.hexdigest()
+
+
+def make_archive(session_id: str, max_bytes: Optional[int] = None):
     root = session_path(session_id)
     if not root.exists():
         raise RuntimeOperationError(
@@ -1281,28 +1450,69 @@ def make_archive(session_id: str):
             f"Workspace not found: {session_id}",
             404,
         )
-    entries, skipped = snapshot_workspace(root, "archive.snapshot")
-    manifest = manifest_from_entries(session_id, entries, skipped)
-    buf = io.BytesIO()
+    entries, skipped = snapshot_workspace(
+        root,
+        "archive.snapshot",
+        max_bytes,
+    )
+    files = []
+    archive_file = tempfile.TemporaryFile(mode="w+b")
     try:
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        with tarfile.open(fileobj=archive_file, mode="w:gz") as tar:
             for entry in entries:
                 info = tarfile.TarInfo(entry["path"])
-                info.size = len(entry["data"])
+                info.size = entry["size"]
                 info.mode = entry["mode"]
                 info.mtime = entry["mtime"]
                 info.uid = 0
                 info.gid = 0
                 info.uname = ""
                 info.gname = ""
-                tar.addfile(info, io.BytesIO(entry["data"]))
+                with entry["source"].open("rb") as source:
+                    stat_result = os.fstat(source.fileno())
+                    if (
+                        not stat.S_ISREG(stat_result.st_mode)
+                        or stat_result.st_size != entry["size"]
+                    ):
+                        raise RuntimeOperationError(
+                            "workspace_changed_during_archive",
+                            "archive.build",
+                            "Workspace file changed while building archive",
+                            409,
+                            {"path": entry["path"]},
+                        )
+                    digesting_source = DigestingReader(source)
+                    tar.addfile(info, digesting_source)
+                    if digesting_source.bytes_read != entry["size"]:
+                        raise RuntimeOperationError(
+                            "workspace_changed_during_archive",
+                            "archive.build",
+                            "Workspace file changed while building archive",
+                            409,
+                            {"path": entry["path"]},
+                        )
+                    files.append({
+                        "path": entry["path"],
+                        "size": entry["size"],
+                        "sha256": digesting_source.hexdigest(),
+                    })
+        archive_file.flush()
+        archive_size = os.fstat(archive_file.fileno()).st_size
+        if max_bytes is not None and archive_size > max_bytes:
+            raise archive_size_exceeded(max_bytes, archive_size)
+        manifest = manifest_from_files(session_id, files, skipped)
+        archive_sha256 = archive_file_sha256(archive_file)
+        return archive_file, manifest, archive_sha256, archive_size
+    except RuntimeOperationError:
+        archive_file.close()
+        raise
     except Exception as error:
+        archive_file.close()
         raise RuntimeOperationError(
             "archive_build_failed",
             "archive.build",
             f"Failed to build workspace archive: {error}",
         ) from error
-    return buf.getvalue(), manifest
 
 
 def safe_archive_member_path(member_name: str) -> PurePosixPath:
@@ -1533,19 +1743,36 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
             if len(parts) == 2 and parts[0] == "archive":
-                data, manifest = make_archive(parts[1])
-                self.send_response(200)
-                self.send_header("content-type", "application/gzip")
-                self.send_header("content-length", str(len(data)))
-                self.send_header("x-archive-sha256", sha256_bytes(data))
-                self.send_header("x-workspace-digest", manifest["digest"])
-                self.send_header("x-file-count", str(manifest["file_count"]))
-                self.send_header(
-                    "x-skipped-file-count", str(manifest["skipped_count"])
+                max_bytes = archive_max_bytes(parsed)
+                archive_file, manifest, archive_sha256, archive_size = (
+                    make_archive(parts[1], max_bytes)
                 )
-                self.send_header("x-archive-format", ARCHIVE_FORMAT)
-                self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.send_response(200)
+                    self.send_header("content-type", "application/gzip")
+                    self.send_header("content-length", str(archive_size))
+                    self.send_header("x-archive-sha256", archive_sha256)
+                    self.send_header("x-workspace-digest", manifest["digest"])
+                    self.send_header(
+                        "x-file-count", str(manifest["file_count"])
+                    )
+                    self.send_header(
+                        "x-workspace-total-bytes",
+                        str(manifest["total_bytes"]),
+                    )
+                    self.send_header(
+                        "x-skipped-file-count",
+                        str(manifest["skipped_count"]),
+                    )
+                    self.send_header("x-archive-format", ARCHIVE_FORMAT)
+                    self.end_headers()
+                    shutil.copyfileobj(
+                        archive_file,
+                        self.wfile,
+                        length=ARCHIVE_IO_CHUNK_BYTES,
+                    )
+                finally:
+                    archive_file.close()
                 return
             if len(parts) >= 2 and parts[0] == "preview":
                 session_id = parts[1]
@@ -1670,13 +1897,26 @@ class Handler(BaseHTTPRequestHandler):
             headers.get("x-codeagent-openai-api-key", ""),
         )
 
-    def serve_terminal(self, session_id: str, base_url: str, agent: str, model: str, openai_api_key: str):
+    def serve_terminal(
+        self,
+        session_id: str,
+        base_url: str,
+        agent: str,
+        model: str,
+        model_gateway_token: str,
+    ):
         if not base_url:
             self.request.sendall(encode_frame(b"Missing base_url\r\n"))
             self.request.close()
             return
         agent = safe_agent(agent)
-        tmux_name, _ = ensure_agent_tmux(session_id, base_url, agent, openai_api_key, model)
+        tmux_name, _ = ensure_agent_tmux(
+            session_id,
+            base_url,
+            agent,
+            model_gateway_token,
+            model,
+        )
         reset_tmux_interaction_state(tmux_name)
         master_fd, slave_fd = pty.openpty()
         rows, cols = terminal_size(DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS)

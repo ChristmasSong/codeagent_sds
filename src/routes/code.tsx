@@ -28,6 +28,7 @@ import {
   Plus,
   Square,
   Terminal,
+  Trash2,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -40,7 +41,6 @@ import type { CodeModelView } from '@/modules/code/models';
 import {
   CODE_SESSION_AGENTS,
   normalizeAgent,
-  previewUrl,
   shouldRestoreWorkspace,
   type CodeSessionAgent,
 } from '@/modules/code/runtime';
@@ -64,6 +64,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
   Select,
@@ -82,7 +83,8 @@ type CodeAction =
   | 'resume'
   | 'suspend'
   | 'discard'
-  | 'end';
+  | 'end'
+  | 'delete-permanently';
 
 interface CodeActionResponse {
   session?: CodeSessionView;
@@ -129,6 +131,7 @@ const COLLAPSED_SESSIONS_WIDTH = 56;
 const MIN_TERMINAL_WIDTH = 420;
 const CODE_SIDEBAR_COLLAPSED_KEY = 'hicode:code-sidebar-collapsed';
 const SIDEBAR_TRANSITION_MS = 200;
+const AUTO_ARCHIVE_INTERVAL_MS = 5 * 60_000;
 const WIDE_WORKBENCH_MEDIA_QUERY = '(min-width: 80rem)';
 
 function workspaceWidthLimit(
@@ -192,8 +195,14 @@ function CodeWorkspacePage() {
   const [newSessionIssue, setNewSessionIssue] =
     useState<SessionStartIssue | null>(null);
   const [confirmNewSessionOpen, setConfirmNewSessionOpen] = useState(false);
+  const [discardConfirmation, setDiscardConfirmation] = useState('');
   const [confirmRestoreSession, setConfirmRestoreSession] =
     useState<CodeSessionView | null>(null);
+  const [confirmEndSessionOpen, setConfirmEndSessionOpen] = useState(false);
+  const [confirmPermanentDeleteSession, setConfirmPermanentDeleteSession] =
+    useState<CodeSessionView | null>(null);
+  const [permanentDeleteConfirmation, setPermanentDeleteConfirmation] =
+    useState('');
   const [runtimeIssue, setRuntimeIssue] = useState<string>('');
   const [busyAction, setBusyAction] = useState<string>('');
   const [previewNonce, setPreviewNonce] = useState(0);
@@ -631,7 +640,7 @@ function CodeWorkspacePage() {
         .catch((error) => {
           if (!cancelled) markArchiveError(terminalSessionId, error);
         });
-    }, 60000);
+    }, AUTO_ARCHIVE_INTERVAL_MS);
 
     return () => {
       cancelled = true;
@@ -698,7 +707,11 @@ function CodeWorkspacePage() {
       const cleanupErrors: string[] = [];
       for (const id of idsToEnd) {
         try {
-          const payload = await runSessionAction(id, currentAction);
+          const payload = await runSessionAction(
+            id,
+            currentAction,
+            currentAction === 'discard' ? { confirmSessionId: id } : undefined
+          );
           if (currentAction === 'suspend') {
             rememberArchivedSession(payload.session);
           }
@@ -741,6 +754,7 @@ function CodeWorkspacePage() {
 
   const requestNewSession = () => {
     if (sessionId) {
+      setDiscardConfirmation('');
       setConfirmNewSessionOpen(true);
       return;
     }
@@ -748,11 +762,41 @@ function CodeWorkspacePage() {
   };
 
   const requestRestoreArchivedSession = (session: CodeSessionView) => {
-    if (sessionId) {
-      setConfirmRestoreSession(session);
-      return;
+    setConfirmRestoreSession(session);
+  };
+
+  const requestPermanentDeleteSession = (session: CodeSessionView) => {
+    setPermanentDeleteConfirmation('');
+    setConfirmPermanentDeleteSession(session);
+  };
+
+  const permanentlyDeleteSession = async (session: CodeSessionView) => {
+    const deletingId = session.id;
+    setBusyAction('delete-permanently');
+    setActionMsg(m['code.actions.running']());
+    try {
+      await runSessionAction(deletingId, 'delete-permanently', {
+        confirmSessionId: deletingId,
+      });
+      setSessions((prev) => prev.filter((item) => item.id !== deletingId));
+      setArchivedSessions((prev) =>
+        prev.filter((item) => item.id !== deletingId)
+      );
+      if (sessionId === deletingId) {
+        setSessionId(null);
+        setArchiveCheckpoint(checkpointFromSession(null));
+      }
+      setConfirmPermanentDeleteSession(null);
+      setPermanentDeleteConfirmation('');
+      setActionMsg(m['code.actions.deleted_permanently']());
+      toast.success(m['code.actions.deleted_permanently']());
+    } catch (err) {
+      const message = (err as Error).message || 'error';
+      setActionMsg(message);
+      toast.error(message);
+    } finally {
+      setBusyAction('');
     }
-    void restoreArchivedSession(session.id);
   };
 
   const endCurrentSession = async () => {
@@ -1423,31 +1467,48 @@ function CodeWorkspacePage() {
                   </p>
                 )}
                 {archivedSessions.map((session) => (
-                  <button
+                  <div
                     key={session.id}
-                    type="button"
-                    className="hover:bg-muted/70 flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60"
-                    disabled={Boolean(busyAction) || restoreInProgress}
-                    onClick={() => requestRestoreArchivedSession(session)}
+                    className="hover:bg-muted/70 flex w-full items-center gap-1 rounded-md pr-1 transition-colors"
                   >
-                    <span className="border-muted-foreground/40 size-2 rounded-full border" />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate font-mono text-xs">
-                        {session.id}
+                    <button
+                      type="button"
+                      className="flex min-w-0 flex-1 items-center gap-3 rounded-md px-3 py-2 text-left text-sm disabled:cursor-not-allowed disabled:opacity-60"
+                      disabled={Boolean(busyAction) || restoreInProgress}
+                      title={m['code.actions.restore_description']()}
+                      onClick={() => requestRestoreArchivedSession(session)}
+                    >
+                      <span className="border-muted-foreground/40 size-2 rounded-full border" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-mono text-xs">
+                          {session.id}
+                        </span>
+                        <span className="text-muted-foreground mt-0.5 flex items-center gap-1 text-[11px]">
+                          <Archive className="size-3" />
+                          {sessionStatusLabel(session.status)} ·{' '}
+                          {agentLabel(session.agent)}
+                        </span>
+                        <span className="text-muted-foreground mt-0.5 block truncate text-[11px]">
+                          {modelLabel(models, session)}
+                        </span>
                       </span>
-                      <span className="text-muted-foreground mt-0.5 flex items-center gap-1 text-[11px]">
-                        <Archive className="size-3" />
-                        {sessionStatusLabel(session.status)} ·{' '}
-                        {agentLabel(session.agent)}
+                      <span className="text-primary shrink-0 text-[11px] font-medium">
+                        {m['code.sessions.restore']()}
                       </span>
-                      <span className="text-muted-foreground mt-0.5 block truncate text-[11px]">
-                        {modelLabel(models, session)}
-                      </span>
-                    </span>
-                    <span className="text-primary shrink-0 text-[11px] font-medium">
-                      {m['code.sessions.restore']()}
-                    </span>
-                  </button>
+                    </button>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className="text-destructive hover:text-destructive size-7 shrink-0"
+                      disabled={Boolean(busyAction) || restoreInProgress}
+                      aria-label={m['code.actions.delete_permanently']()}
+                      title={m['code.actions.delete_permanently_description']()}
+                      onClick={() => requestPermanentDeleteSession(session)}
+                    >
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                  </div>
                 ))}
               </div>
             </div>
@@ -1855,11 +1916,11 @@ function CodeWorkspacePage() {
                       <iframe
                         title={m['code.preview.title']()}
                         className="h-full min-h-0 w-full bg-white"
-                        src={`${previewUrl(
-                          loader.runtimeBase,
-                          currentRuntimeUserId,
+                        src={`/api/code/sessions/${encodeURIComponent(
                           terminalSessionId
-                        )}?t=${previewNonce}`}
+                        )}/preview?t=${previewNonce}`}
+                        sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
+                        referrerPolicy="no-referrer"
                       />
                     ) : (
                       <div className="text-muted-foreground flex h-full items-center justify-center px-4 text-center text-xs">
@@ -1927,6 +1988,7 @@ function CodeWorkspacePage() {
                           variant="outline"
                           className="h-7 shrink-0 rounded-full text-xs"
                           disabled={controlsDisabled}
+                          title={m['code.actions.archive_description']()}
                           onClick={() => void runAction('archive')}
                         >
                           {m['code.archive.retry']()}
@@ -1940,6 +2002,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.health_description']()}
                     onClick={() => void runAction('health')}
                   >
                     {m['code.actions.health']()}
@@ -1949,6 +2012,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.inspect_description']()}
                     onClick={() => void runAction('inspect')}
                   >
                     {m['code.actions.inspect']()}
@@ -1958,6 +2022,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.archive_description']()}
                     onClick={() => void runAction('archive')}
                   >
                     {m['code.actions.archive']()}
@@ -1967,6 +2032,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.restore_description']()}
                     onClick={() => void runAction('restore')}
                   >
                     {m['code.actions.restore']()}
@@ -1976,6 +2042,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.suspend_description']()}
                     onClick={() => void runAction('suspend')}
                   >
                     {m['code.actions.suspend']()}
@@ -1985,12 +2052,30 @@ function CodeWorkspacePage() {
                     variant="destructive"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
-                    onClick={() => void endCurrentSession()}
+                    title={m['code.actions.end_description']()}
+                    onClick={() => setConfirmEndSessionOpen(true)}
                   >
                     <Square className="size-3" />
                     {m['code.actions.end']()}
                   </Button>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    className="h-7 rounded-full text-xs"
+                    disabled={controlsDisabled || !currentSession}
+                    title={m['code.actions.delete_permanently_description']()}
+                    onClick={() =>
+                      currentSession &&
+                      requestPermanentDeleteSession(currentSession)
+                    }
+                  >
+                    <Trash2 className="size-3" />
+                    {m['code.actions.delete_permanently']()}
+                  </Button>
                 </div>
+                <p className="text-muted-foreground mt-3 text-xs leading-5">
+                  {m['code.actions.storage_help']()}
+                </p>
                 <p className="text-muted-foreground mt-3 min-h-4 font-mono text-xs">
                   {actionMsg}
                 </p>
@@ -2002,7 +2087,10 @@ function CodeWorkspacePage() {
 
       <Dialog
         open={confirmNewSessionOpen}
-        onOpenChange={setConfirmNewSessionOpen}
+        onOpenChange={(open) => {
+          setConfirmNewSessionOpen(open);
+          if (!open) setDiscardConfirmation('');
+        }}
       >
         <DialogContent>
           <DialogHeader>
@@ -2023,6 +2111,26 @@ function CodeWorkspacePage() {
                 {m['code.sessions.new_confirm_discard_title']()}
               </p>
               <p>{m['code.sessions.new_confirm_discard_description']()}</p>
+              {currentSession && (
+                <div className="mt-3 space-y-2">
+                  <Label htmlFor="discard-session-confirmation">
+                    {m['code.actions.delete_permanently_confirmation_label']()}
+                  </Label>
+                  <p className="font-mono text-xs break-all">
+                    {currentSession.id}
+                  </p>
+                  <Input
+                    id="discard-session-confirmation"
+                    autoComplete="off"
+                    value={discardConfirmation}
+                    placeholder={currentSession.id}
+                    disabled={Boolean(busyAction)}
+                    onChange={(event) =>
+                      setDiscardConfirmation(event.target.value)
+                    }
+                  />
+                </div>
+              )}
             </div>
           </div>
           <DialogFooter className="gap-2 sm:justify-end">
@@ -2036,8 +2144,14 @@ function CodeWorkspacePage() {
             <Button
               type="button"
               variant="destructive"
+              disabled={
+                !currentSession ||
+                discardConfirmation !== currentSession.id ||
+                Boolean(busyAction)
+              }
               onClick={() => {
                 setConfirmNewSessionOpen(false);
+                setDiscardConfirmation('');
                 void newSession('discard');
               }}
             >
@@ -2097,14 +2211,141 @@ function CodeWorkspacePage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog
+        open={confirmEndSessionOpen}
+        onOpenChange={(open) => {
+          if (!open && !busyAction) setConfirmEndSessionOpen(false);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{m['code.actions.end_confirm_title']()}</DialogTitle>
+            <DialogDescription>
+              {m['code.actions.end_confirm_description']()}
+            </DialogDescription>
+          </DialogHeader>
+          {currentSession && (
+            <p className="text-muted-foreground rounded-md border px-3 py-2 font-mono text-xs">
+              {currentSession.id}
+            </p>
+          )}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={Boolean(busyAction)}
+              onClick={() => setConfirmEndSessionOpen(false)}
+            >
+              {m['code.actions.confirm_cancel']()}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={Boolean(busyAction) || !currentSession}
+              onClick={() => {
+                setConfirmEndSessionOpen(false);
+                void endCurrentSession();
+              }}
+            >
+              {m['code.actions.end_confirm_confirm']()}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(confirmPermanentDeleteSession)}
+        onOpenChange={(open) => {
+          if (!open && !busyAction) {
+            setConfirmPermanentDeleteSession(null);
+            setPermanentDeleteConfirmation('');
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {m['code.actions.delete_permanently_confirm_title']()}
+            </DialogTitle>
+            <DialogDescription>
+              {m['code.actions.delete_permanently_confirm_description']()}
+            </DialogDescription>
+          </DialogHeader>
+          {confirmPermanentDeleteSession && (
+            <div className="space-y-4">
+              <div className="border-destructive/40 bg-destructive/5 text-destructive rounded-md border px-3 py-3 text-sm leading-5">
+                <div className="flex items-start gap-2 font-medium">
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                  <span>{m['code.actions.delete_permanently_warning']()}</span>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="permanent-delete-session-confirmation">
+                  {m['code.actions.delete_permanently_confirmation_label']()}
+                </Label>
+                <p className="text-muted-foreground font-mono text-xs break-all">
+                  {confirmPermanentDeleteSession.id}
+                </p>
+                <Input
+                  id="permanent-delete-session-confirmation"
+                  autoComplete="off"
+                  value={permanentDeleteConfirmation}
+                  placeholder={confirmPermanentDeleteSession.id}
+                  disabled={busyAction === 'delete-permanently'}
+                  onChange={(event) =>
+                    setPermanentDeleteConfirmation(event.target.value)
+                  }
+                />
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={busyAction === 'delete-permanently'}
+              onClick={() => {
+                setConfirmPermanentDeleteSession(null);
+                setPermanentDeleteConfirmation('');
+              }}
+            >
+              {m['code.actions.confirm_cancel']()}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={
+                !confirmPermanentDeleteSession ||
+                permanentDeleteConfirmation !==
+                  confirmPermanentDeleteSession.id ||
+                Boolean(busyAction)
+              }
+              onClick={() => {
+                const session = confirmPermanentDeleteSession;
+                if (session) void permanentlyDeleteSession(session);
+              }}
+            >
+              <Trash2 className="size-4" />
+              {busyAction === 'delete-permanently'
+                ? m['code.actions.running']()
+                : m['code.actions.delete_permanently_confirm_confirm']()}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
-async function runSessionAction(sessionId: string, action: CodeAction) {
+async function runSessionAction(
+  sessionId: string,
+  action: CodeAction,
+  input?: { confirmSessionId?: string }
+) {
   return apiPost<CodeActionResponse>(
     `/api/code/sessions/${encodeURIComponent(sessionId)}/actions`,
-    { action }
+    { action, ...input }
   );
 }
 

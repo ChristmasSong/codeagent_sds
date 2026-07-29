@@ -3,6 +3,7 @@ import {
   Bot,
   CreditCard,
   FolderOpen,
+  HardDrive,
   Home,
   LayoutDashboard,
   LifeBuoy,
@@ -78,6 +79,12 @@ function AdminLayout() {
         },
         { href: '/admin/code-models', label: m['admin.nav.code_models']() },
       ],
+    },
+    {
+      href: '/admin/storage',
+      label: m['admin.nav.storage'](),
+      icon: HardDrive,
+      group,
     },
   ];
 

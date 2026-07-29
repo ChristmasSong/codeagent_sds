@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FitAddon } from '@xterm/addon-fit';
 import type { Terminal } from '@xterm/xterm';
 
-import { terminalWsUrl, type CodeSessionAgent } from '@/modules/code/runtime';
+import type { CodeSessionAgent } from '@/modules/code/runtime';
 
 export type TerminalStatus =
   | 'idle'
@@ -33,10 +33,6 @@ interface Options {
 export function useTerminalSession({
   sessionId,
   container,
-  runtimeBase,
-  runtimeUserId,
-  agent,
-  model,
   onConnectionEvent,
 }: Options): {
   status: TerminalStatus;
@@ -108,26 +104,20 @@ export function useTerminalSession({
     return textDecoderRef.current.decode(bytes, { stream: true });
   }, []);
 
-  const sessionTerminalUrls = useCallback(
-    (id: string) => {
-      const proxy = new URL(
-        `/api/code/sessions/${encodeURIComponent(id)}/terminal`,
-        window.location.href
-      );
-      proxy.protocol = proxy.protocol === 'https:' ? 'wss:' : 'ws:';
+  const sessionTerminalUrls = useCallback((id: string) => {
+    const proxy = new URL(
+      `/api/code/sessions/${encodeURIComponent(id)}/terminal`,
+      window.location.href
+    );
+    proxy.protocol = proxy.protocol === 'https:' ? 'wss:' : 'ws:';
 
-      const urls: Array<{ mode: TerminalConnectionMode; url: string }> = [];
-      if (runtimeBase && runtimeUserId) {
-        urls.push({
-          mode: 'direct',
-          url: terminalWsUrl(runtimeBase, runtimeUserId, id, agent, model),
-        });
-      }
-      urls.push({ mode: 'proxy', url: proxy.toString() });
-      return urls;
-    },
-    [agent, model, runtimeBase, runtimeUserId]
-  );
+    return [
+      {
+        mode: 'proxy' as const,
+        url: proxy.toString(),
+      },
+    ];
+  }, []);
 
   const sendResize = useCallback(
     (redraw = false) => {

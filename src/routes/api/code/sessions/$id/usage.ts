@@ -52,6 +52,7 @@ async function POST({
             body.estimatedInputTokens ?? body.estimated_input_tokens,
           maxOutputTokens: body.maxOutputTokens ?? body.max_output_tokens,
           authorizationKey: body.authorizationKey ?? body.authorization_key,
+          requestedModel: body.requestedModel ?? body.requested_model,
         })
       );
     }

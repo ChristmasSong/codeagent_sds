@@ -2,6 +2,7 @@ import { createFileRoute, Outlet } from '@tanstack/react-router';
 import {
   Coins,
   CreditCard,
+  HardDrive,
   Home,
   Key,
   LayoutDashboard,
@@ -57,6 +58,12 @@ function SettingsLayout() {
       href: '/settings/apikeys',
       label: m['settings.nav.apikeys'](),
       icon: Key,
+      group,
+    },
+    {
+      href: '/settings/storage',
+      label: m['settings.nav.storage'](),
+      icon: HardDrive,
       group,
     },
     {

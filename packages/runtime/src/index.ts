@@ -1,12 +1,27 @@
 import { Container } from '@cloudflare/containers';
 
 import {
+  archiveCleanupPlan,
+  archiveTemporaryPrefix,
+  archiveVersionKey,
+  archiveVersionsPrefix,
+  isSessionArchiveKey,
+  isVersionArchiveKey,
+  legacyArchiveKey,
+  newestArchiveObject,
+  sessionArchivePrefix,
+  userArchivePrefix,
+  type ArchiveCleanupReason,
+  type ArchiveObjectLike,
+} from './archive-storage';
+import {
   deliverOrQueueUsageReport,
   flushPendingUsageReports,
   queueUsageReport,
   type UsageReportPayload,
 } from './billing-outbox';
 import { resolveProviderUsageReport } from './provider-usage';
+import { runStorageGcSchedule } from './storage-gc-scheduler';
 import { extractTokenUsage } from './token-usage';
 
 interface Env {
@@ -19,6 +34,7 @@ interface Env {
   YUNWU_USER_ID?: string;
   APP_BASE_URL?: string;
   BILLING_USAGE_WEBHOOK_SECRET?: string;
+  WORKSPACE_ARCHIVE_HARD_LIMIT_BYTES?: string;
 }
 
 interface Manifest {
@@ -27,6 +43,7 @@ interface Manifest {
   exists?: boolean;
   digest?: string | null;
   file_count?: number;
+  total_bytes?: number;
   skipped_count?: number;
 }
 
@@ -110,16 +127,27 @@ function withSessionParams(target: URL, agent: Agent, model = ''): URL {
 
 function containerHeaders(
   request: Request,
-  env: Env,
   agent: Agent,
-  model = ''
+  model = '',
+  modelGatewayToken = ''
 ): Headers {
   const headers = new Headers(request.headers);
+  // Runtime-management credentials authorize the Worker, never the tenant
+  // container. Provider credentials supplied by a caller must not cross that
+  // boundary either.
+  headers.delete('x-hicode-runtime-secret');
+  headers.delete('x-hicode-billing-secret');
+  headers.delete('authorization');
+  headers.delete('x-api-key');
+  headers.delete('cookie');
+  headers.delete('x-codeagent-openai-api-key');
   headers.set('x-codeagent-agent', agent);
   if (model) headers.set('x-codeagent-model', model);
-  const codexApiKey = env.OPENAI_API_KEY || env.ANTHROPIC_API_KEY;
-  if (agent === 'codex' && codexApiKey) {
-    headers.set('x-codeagent-openai-api-key', codexApiKey);
+  if (modelGatewayToken) {
+    // This is a session-scoped HMAC credential. It cannot authorize another
+    // session and is intentionally the only model credential the container
+    // receives.
+    headers.set('x-codeagent-openai-api-key', modelGatewayToken);
   }
   return headers;
 }
@@ -130,9 +158,9 @@ function json(data: unknown, init: ResponseInit = {}): Response {
     headers: {
       'content-type': 'application/json; charset=utf-8',
       'access-control-allow-origin': '*',
-      'access-control-allow-methods': 'GET,POST,PUT,OPTIONS',
+      'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS',
       'access-control-allow-headers':
-        'authorization,content-type,x-api-key,anthropic-version,anthropic-beta,openai-organization,openai-project',
+        'authorization,content-type,x-api-key,anthropic-version,anthropic-beta,openai-organization,openai-project,x-hicode-runtime-secret,x-hicode-archive-key',
       ...init.headers,
     },
   });
@@ -146,7 +174,6 @@ function page(
   const safeUserId = encodeURIComponent(userId);
   const safeSessionId = encodeURIComponent(sessionId);
   const appUrl = `${origin}/app/${safeUserId}/${safeSessionId}`;
-  const previewUrl = `${origin}/preview/${safeUserId}/${safeSessionId}/`;
   return new Response(
     `<!doctype html>
 <html lang="en">
@@ -309,10 +336,10 @@ function page(
         <div class="actions">
           <button id="reconnect" class="primary" type="button">Reconnect</button>
           <button id="health" type="button">Health</button>
-          <button id="seed" type="button">Seed</button>
-          <button id="archive" type="button">Archive</button>
-          <button id="restore" type="button">Restore</button>
-          <a id="previewLink" href="${previewUrl}" target="_blank" rel="noreferrer">Preview</a>
+          <button id="seed" type="button" disabled title="Use the authenticated app API">Seed</button>
+          <button id="archive" type="button" disabled title="Use the authenticated app API">Archive</button>
+          <button id="restore" type="button" disabled title="Use the authenticated app API">Restore</button>
+          <span title="Use the authenticated application">Preview protected</span>
         </div>
         <div id="status" class="status">idle</div>
       </header>
@@ -322,8 +349,8 @@ function page(
           <div id="logline" class="logline">terminal</div>
         </section>
         <aside class="previewPane">
-          <div class="previewHeader"><span>${previewUrl}</span></div>
-          <iframe id="preview" src="${previewUrl}"></iframe>
+          <div class="previewHeader"><span>Preview requires an authenticated signed URL</span></div>
+          <div class="empty">Open this session from the authenticated application.</div>
         </aside>
       </main>
     </div>
@@ -334,15 +361,12 @@ function page(
         var userId = ${JSON.stringify(userId)};
         var sessionId = ${JSON.stringify(sessionId)};
         var terminalPath = "/terminal/" + encodeURIComponent(userId) + "/" + encodeURIComponent(sessionId);
-        var previewPath = "/preview/" + encodeURIComponent(userId) + "/" + encodeURIComponent(sessionId) + "/";
         var socket = null;
         var fitAddon = null;
         var term = null;
         var reconnecting = false;
         var status = document.getElementById("status");
         var logline = document.getElementById("logline");
-        var preview = document.getElementById("preview");
-        var previewLink = document.getElementById("previewLink");
 
         function setStatus(text) {
           status.textContent = text;
@@ -372,12 +396,6 @@ function page(
             throw new Error(payload.error || JSON.stringify(payload));
           }
           return payload;
-        }
-
-        function refreshPreview() {
-          var next = previewPath + "?t=" + Date.now();
-          preview.src = next;
-          previewLink.href = previewPath;
         }
 
         function connect() {
@@ -445,32 +463,16 @@ function page(
           });
           window.addEventListener("resize", resize);
           wireButton("reconnect", async function () {
-            connect();
+            setStatus("protected");
+            log("Open this session from the authenticated application.");
           });
           wireButton("health", async function () {
-            var payload = await action("health", "/container-health/" + encodeURIComponent(userId));
-            log(payload.tmux + " / " + payload.claude);
-            setStatus("healthy");
-          });
-          wireButton("seed", async function () {
-            var payload = await action("seed", "/seed/" + encodeURIComponent(userId) + "/" + encodeURIComponent(sessionId), { method: "POST" });
-            log("seed digest " + payload.digest);
-            setStatus("seeded");
-            refreshPreview();
-          });
-          wireButton("archive", async function () {
-            var payload = await action("archive", "/archive/" + encodeURIComponent(userId) + "/" + encodeURIComponent(sessionId));
-            log("archive " + payload.key);
-            setStatus("archived");
-          });
-          wireButton("restore", async function () {
-            var payload = await action("restore", "/restore/" + encodeURIComponent(userId) + "/" + encodeURIComponent(sessionId));
-            log("restore " + payload.key);
-            setStatus("restored");
-            refreshPreview();
+            setStatus("protected");
+            log("Runtime diagnostics require the authenticated application.");
           });
           resize();
-          connect();
+          setStatus("protected");
+          log("Open this session from the authenticated application.");
         }
 
         boot();
@@ -482,24 +484,471 @@ function page(
   );
 }
 
-function archiveKey(userId: string, sessionId: string): string {
-  return `integrated-workspaces/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}/workspace.tar.gz`;
-}
-
-function archiveVersionKey(
-  userId: string,
-  sessionId: string,
-  now = new Date()
-): string {
-  const timestamp = now.toISOString().replace(/[:.]/g, '-');
-  return `integrated-workspaces/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}/archives/${timestamp}.tar.gz`;
-}
-
 function metadataFileCount(
   metadata: Record<string, string> | undefined
 ): number {
   const parsed = Number.parseInt(metadata?.fileCount || '0', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+interface ArchiveDeletedObject {
+  key: string;
+  bytes: number;
+  reason?: ArchiveCleanupReason | 'explicit' | 'all' | 'snapshot';
+}
+
+interface ArchiveDeleteFailure {
+  key: string;
+  error: string;
+}
+
+interface ArchiveObjectPage {
+  objects: R2Object[];
+  truncated: boolean;
+  cursor?: string;
+}
+
+const archiveManagementPageSize = 1000;
+const archiveDeleteKeyLimit = 100;
+const integratedWorkspacesPrefix = 'integrated-workspaces/';
+
+function runtimeSecretAuthorized(request: Request, env: Env): boolean {
+  return Boolean(
+    env.BILLING_USAGE_WEBHOOK_SECRET &&
+    request.headers.get('x-hicode-runtime-secret') ===
+      env.BILLING_USAGE_WEBHOOK_SECRET
+  );
+}
+
+const modelGatewayTokenPrefix = 'cgw1_';
+const previewTokenLifetimeSeconds = 5 * 60;
+const previewTokenClockSkewSeconds = 30;
+const encoder = new TextEncoder();
+
+function encodeBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function decodeBase64Url(value: string): ArrayBuffer | null {
+  if (!value || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  try {
+    const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes.buffer;
+  } catch {
+    return null;
+  }
+}
+
+async function hmacKey(secret: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify']
+  );
+}
+
+async function signHmac(secret: string, message: string): Promise<string> {
+  const signature = await crypto.subtle.sign(
+    'HMAC',
+    await hmacKey(secret),
+    encoder.encode(message)
+  );
+  return encodeBase64Url(new Uint8Array(signature));
+}
+
+async function verifyHmac(
+  secret: string,
+  message: string,
+  encodedSignature: string
+): Promise<boolean> {
+  const signature = decodeBase64Url(encodedSignature);
+  if (!signature || signature.byteLength !== 32) return false;
+  return crypto.subtle.verify(
+    'HMAC',
+    await hmacKey(secret),
+    signature,
+    encoder.encode(message)
+  );
+}
+
+function modelGatewayMessage(sessionId: string): string {
+  return `model-gateway:v1\0${sessionId}`;
+}
+
+async function modelGatewaySessionToken(
+  env: Env,
+  sessionId: string
+): Promise<string> {
+  const secret = (env.BILLING_USAGE_WEBHOOK_SECRET || '').trim();
+  if (!secret) {
+    throw new RuntimeOperationError(
+      503,
+      'model_gateway_not_configured',
+      'model.gateway',
+      'Model gateway session authentication is not configured'
+    );
+  }
+  return `${modelGatewayTokenPrefix}${await signHmac(
+    secret,
+    modelGatewayMessage(sessionId)
+  )}`;
+}
+
+function modelGatewayCredential(request: Request): string {
+  const authorization = request.headers.get('authorization') || '';
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i);
+  return (bearer?.[1] || request.headers.get('x-api-key') || '').trim();
+}
+
+async function modelGatewayAuthorized(
+  request: Request,
+  env: Env,
+  sessionId: string
+): Promise<boolean> {
+  const secret = (env.BILLING_USAGE_WEBHOOK_SECRET || '').trim();
+  if (!secret) {
+    throw new RuntimeOperationError(
+      503,
+      'model_gateway_not_configured',
+      'model.gateway',
+      'Model gateway session authentication is not configured'
+    );
+  }
+  const credential = modelGatewayCredential(request);
+  if (!credential.startsWith(modelGatewayTokenPrefix)) return false;
+  return verifyHmac(
+    secret,
+    modelGatewayMessage(sessionId),
+    credential.slice(modelGatewayTokenPrefix.length)
+  );
+}
+
+function previewMessage(
+  userId: string,
+  sessionId: string,
+  expiresAt: number
+): string {
+  return `preview:v1\0${userId}\0${sessionId}\0${expiresAt}`;
+}
+
+async function previewTokenAuthorized(
+  env: Env,
+  userId: string,
+  sessionId: string,
+  token: string
+): Promise<boolean> {
+  const secret = (env.BILLING_USAGE_WEBHOOK_SECRET || '').trim();
+  if (!secret) return false;
+  const separator = token.indexOf('.');
+  if (separator <= 0 || separator === token.length - 1) return false;
+  const expiresText = token.slice(0, separator);
+  const signature = token.slice(separator + 1);
+  if (!/^\d{1,12}$/.test(expiresText)) return false;
+  const expiresAt = Number(expiresText);
+  if (!Number.isSafeInteger(expiresAt)) return false;
+  const now = Math.floor(Date.now() / 1000);
+  if (
+    expiresAt < now - previewTokenClockSkewSeconds ||
+    expiresAt > now + previewTokenLifetimeSeconds + previewTokenClockSkewSeconds
+  ) {
+    return false;
+  }
+  return verifyHmac(
+    secret,
+    previewMessage(userId, sessionId, expiresAt),
+    signature
+  );
+}
+
+function requestedArchiveKey(request: Request, url: URL): string {
+  return (
+    request.headers.get('x-hicode-archive-key') ||
+    url.searchParams.get('key') ||
+    ''
+  ).trim();
+}
+
+function requestedTargetArchiveKey(request: Request): string {
+  return (request.headers.get('x-hicode-target-archive-key') || '').trim();
+}
+
+function archiveObjectSummary(object: R2Object): ArchiveObjectLike {
+  return {
+    key: object.key,
+    size: object.size,
+    uploaded: object.uploaded,
+    etag: object.etag,
+    customMetadata: object.customMetadata,
+  };
+}
+
+function archiveObjectJson(object: R2Object) {
+  return {
+    key: object.key,
+    size: object.size,
+    etag: object.etag,
+    uploaded: object.uploaded.toISOString(),
+    customMetadata: object.customMetadata || {},
+  };
+}
+
+function archiveListLimit(url: URL): number {
+  const parsed = Number.parseInt(url.searchParams.get('limit') || '100', 10);
+  if (!Number.isFinite(parsed)) return 100;
+  return Math.min(archiveManagementPageSize, Math.max(1, parsed));
+}
+
+function archiveMaxBytes(url: URL, env: Env): number | null {
+  const value = url.searchParams.get('maxBytes');
+  if (value === null) return null;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new RuntimeOperationError(
+      400,
+      'invalid_archive_max_bytes',
+      'archive.quota',
+      'maxBytes must be a non-negative safe integer'
+    );
+  }
+  const configuredHardLimit = Number(env.WORKSPACE_ARCHIVE_HARD_LIMIT_BYTES);
+  const hardLimit =
+    Number.isSafeInteger(configuredHardLimit) && configuredHardLimit > 0
+      ? configuredHardLimit
+      : 2 * 1024 ** 3;
+  return Math.min(parsed, hardLimit);
+}
+
+function archiveRetentionDays(url: URL): number {
+  const parsed = Number.parseInt(
+    url.searchParams.get('retentionDays') || '7',
+    10
+  );
+  return Number.isFinite(parsed) ? Math.min(365, Math.max(1, parsed)) : 7;
+}
+
+function archiveMaxSnapshots(url: URL): number {
+  const parsed = Number.parseInt(
+    url.searchParams.get('maxSnapshots') || '2',
+    10
+  );
+  return Number.isFinite(parsed) ? Math.min(50, Math.max(0, parsed)) : 2;
+}
+
+async function listArchiveObjectPage(
+  bucket: R2Bucket,
+  prefix: string,
+  options: { cursor?: string; limit?: number } = {}
+): Promise<ArchiveObjectPage> {
+  const listOptions = {
+    prefix,
+    limit: options.limit || archiveManagementPageSize,
+    include: ['customMetadata'],
+    ...(options.cursor ? { cursor: options.cursor } : {}),
+  } as R2ListOptions;
+  const listed = await bucket.list(listOptions);
+  return {
+    objects: listed.objects,
+    truncated: listed.truncated,
+    ...(listed.truncated ? { cursor: listed.cursor } : {}),
+  };
+}
+
+async function listAllArchiveObjects(
+  bucket: R2Bucket,
+  prefix: string
+): Promise<R2Object[]> {
+  const objects: R2Object[] = [];
+  let cursor = '';
+  do {
+    const page = await listArchiveObjectPage(bucket, prefix, {
+      cursor: cursor || undefined,
+      limit: archiveManagementPageSize,
+    });
+    objects.push(...page.objects);
+    cursor = page.cursor || '';
+    if (!page.truncated) break;
+  } while (cursor);
+  return objects;
+}
+
+async function resolveCurrentArchiveObject(
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  requestedKey: string,
+  versionObjects?: R2Object[]
+): Promise<{ object: R2Object | null; requestedKeyMissing: boolean }> {
+  if (
+    requestedKey &&
+    requestedKey !== legacyArchiveKey(userId, sessionId) &&
+    !isVersionArchiveKey(userId, sessionId, requestedKey)
+  ) {
+    throw new RuntimeOperationError(
+      400,
+      'invalid_archive_key',
+      'archive.resolve',
+      'Archive key is not a restorable object for the requested session',
+      { requestedKey }
+    );
+  }
+
+  if (requestedKey) {
+    const requested = await bucket.head(requestedKey);
+    if (requested) {
+      return { object: requested, requestedKeyMissing: false };
+    }
+  }
+
+  const versions =
+    versionObjects ||
+    (await listAllArchiveObjects(
+      bucket,
+      archiveVersionsPrefix(userId, sessionId)
+    ));
+  const newest = newestArchiveObject(versions.map(archiveObjectSummary));
+  if (newest) {
+    const object = await bucket.head(newest.key);
+    if (object) {
+      return { object, requestedKeyMissing: Boolean(requestedKey) };
+    }
+  }
+
+  const legacy = await bucket.head(legacyArchiveKey(userId, sessionId));
+  return {
+    object: legacy,
+    requestedKeyMissing: Boolean(requestedKey),
+  };
+}
+
+async function deleteArchiveObjects(
+  bucket: R2Bucket,
+  candidates: Array<{
+    object: ArchiveObjectLike;
+    reason?: ArchiveDeletedObject['reason'];
+  }>
+): Promise<{
+  deleted: ArchiveDeletedObject[];
+  failed: ArchiveDeleteFailure[];
+}> {
+  const deleted: ArchiveDeletedObject[] = [];
+  const failed: ArchiveDeleteFailure[] = [];
+  const unique = new Map<
+    string,
+    {
+      object: ArchiveObjectLike;
+      reason?: ArchiveDeletedObject['reason'];
+    }
+  >();
+  for (const candidate of candidates) {
+    unique.set(candidate.object.key, candidate);
+  }
+
+  for (const candidate of unique.values()) {
+    let deleteError = '';
+    try {
+      await bucket.delete(candidate.object.key);
+    } catch (error) {
+      deleteError = error instanceof Error ? error.message : String(error);
+    }
+    try {
+      const remaining = await bucket.head(candidate.object.key);
+      if (!remaining) {
+        deleted.push({
+          key: candidate.object.key,
+          bytes: candidate.object.size,
+          ...(candidate.reason ? { reason: candidate.reason } : {}),
+        });
+        continue;
+      }
+      failed.push({
+        key: candidate.object.key,
+        error: deleteError || 'R2 object still exists after deletion',
+      });
+    } catch (error) {
+      failed.push({
+        key: candidate.object.key,
+        error:
+          deleteError ||
+          (error instanceof Error ? error.message : String(error)),
+      });
+    }
+  }
+  return { deleted, failed };
+}
+
+async function cleanupSessionArchives(
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  currentKey: string,
+  versionObjects: R2Object[],
+  options: {
+    now?: Date;
+    retainPrevious?: boolean;
+    previousObject?: R2Object | null;
+    retentionDays?: number;
+    maxSnapshots?: number;
+  } = {}
+) {
+  const preflightFailures: ArchiveDeleteFailure[] = [];
+  let temporaryObjects: R2Object[] = [];
+  try {
+    temporaryObjects = await listAllArchiveObjects(
+      bucket,
+      archiveTemporaryPrefix(userId, sessionId)
+    );
+  } catch (error) {
+    preflightFailures.push({
+      key: archiveTemporaryPrefix(userId, sessionId),
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  const planned = archiveCleanupPlan(
+    versionObjects.map(archiveObjectSummary),
+    temporaryObjects.map(archiveObjectSummary),
+    currentKey,
+    {
+      now: options.now,
+      retainPrevious: options.retainPrevious,
+      maxSnapshots: options.maxSnapshots,
+      historyTtlMs: (options.retentionDays || 7) * 24 * 60 * 60 * 1000,
+    }
+  );
+  const candidates: Array<{
+    object: ArchiveObjectLike;
+    reason?: ArchiveDeletedObject['reason'];
+  }> = planned.map((candidate) => candidate);
+
+  if (
+    options.retainPrevious === false &&
+    options.previousObject &&
+    options.previousObject.key !== currentKey &&
+    isSessionArchiveKey(userId, sessionId, options.previousObject.key)
+  ) {
+    candidates.push({
+      object: archiveObjectSummary(options.previousObject),
+      reason: 'replace_current',
+    });
+  }
+
+  const result = await deleteArchiveObjects(bucket, candidates);
+  return {
+    deleted: result.deleted,
+    failed: [...preflightFailures, ...result.failed],
+  };
 }
 
 function container(env: Env, userId: string) {
@@ -658,35 +1107,103 @@ async function archive(
   env: Env,
   origin: string,
   userId: string,
-  sessionId: string
+  sessionId: string,
+  currentArchiveKey = '',
+  targetArchiveKey = '',
+  retainPrevious = true,
+  maxBytes: number | null = null,
+  retentionDays = 7,
+  maxSnapshots = 2
 ) {
+  if (
+    targetArchiveKey &&
+    !isVersionArchiveKey(userId, sessionId, targetArchiveKey)
+  ) {
+    throw new RuntimeOperationError(
+      400,
+      'invalid_target_archive_key',
+      'archive.prepare',
+      'Target archive key is outside the current session archive namespace'
+    );
+  }
   const target = new URL(origin);
   target.pathname = `/archive/${encodeURIComponent(sessionId)}`;
+  if (maxBytes !== null) {
+    target.searchParams.set('maxBytes', String(maxBytes));
+  }
   const response = await container(env, userId).fetch(new Request(target));
   if (!response.ok) {
     throw await containerRequestError(response, target.pathname);
   }
 
-  const body = await response.arrayBuffer();
-  const key = archiveKey(userId, sessionId);
-  const latest = await env.WORKSPACE_ARCHIVES.head(key);
   const workspaceDigest = response.headers.get('x-workspace-digest') || '';
   const archiveSha256 = response.headers.get('x-archive-sha256') || '';
   const fileCount = response.headers.get('x-file-count') || '0';
+  const totalBytes = response.headers.get('x-workspace-total-bytes') || '0';
   const skippedFileCount = response.headers.get('x-skipped-file-count') || '0';
   const archiveFormat = response.headers.get('x-archive-format') || '2';
+  const contentLength = Number(response.headers.get('content-length'));
+  if (
+    maxBytes !== null &&
+    Number.isSafeInteger(contentLength) &&
+    contentLength > maxBytes
+  ) {
+    await response.body?.cancel().catch(() => undefined);
+    return json(
+      {
+        ok: false,
+        error: 'Workspace archive exceeds the reserved storage capacity',
+        code: 'archive_size_exceeded',
+        stage: 'archive.quota',
+        details: {
+          maxBytes,
+          actualBytes: contentLength,
+          currentKey: currentArchiveKey || null,
+        },
+      },
+      { status: 413 }
+    );
+  }
   const currentFileCount = Number.parseInt(fileCount, 10) || 0;
-  const previousFileCount = metadataFileCount(latest?.customMetadata);
+  let versionObjects: R2Object[];
+  let resolved: {
+    object: R2Object | null;
+    requestedKeyMissing: boolean;
+  };
+  try {
+    versionObjects = await listAllArchiveObjects(
+      env.WORKSPACE_ARCHIVES,
+      archiveVersionsPrefix(userId, sessionId)
+    );
+    resolved = await resolveCurrentArchiveObject(
+      env.WORKSPACE_ARCHIVES,
+      userId,
+      sessionId,
+      currentArchiveKey,
+      versionObjects
+    );
+  } catch (error) {
+    await response.body?.cancel().catch(() => undefined);
+    throw error;
+  }
+  const previous = resolved.object;
+  const previousFileCount = metadataFileCount(previous?.customMetadata);
 
-  if (latest && previousFileCount > 0 && currentFileCount === 0) {
+  if (previous && previousFileCount > 0 && currentFileCount === 0) {
+    await response.body?.cancel().catch(() => undefined);
     return json(
       {
         ok: false,
         error: 'Empty workspace archive was blocked',
         code: 'empty_workspace_archive_blocked',
         stage: 'archive.guard',
-        details: { key, previousFileCount, currentFileCount },
-        key,
+        details: {
+          currentKey: previous.key,
+          previousFileCount,
+          currentFileCount,
+        },
+        key: previous.key,
+        currentKey: previous.key,
         previousFileCount,
         workspaceDigest,
         archiveSha256,
@@ -697,39 +1214,137 @@ async function archive(
   }
 
   const now = new Date();
-  const versionKey = archiveVersionKey(userId, sessionId, now);
+  if (
+    previous &&
+    workspaceDigest &&
+    previous.customMetadata?.workspaceDigest === workspaceDigest
+  ) {
+    await response.body?.cancel().catch(() => undefined);
+    const cleanup = await cleanupSessionArchives(
+      env.WORKSPACE_ARCHIVES,
+      userId,
+      sessionId,
+      previous.key,
+      versionObjects,
+      {
+        now,
+        retainPrevious,
+        previousObject: previous,
+        retentionDays,
+        maxSnapshots,
+      }
+    );
+    return json({
+      ok: true,
+      key: previous.key,
+      currentKey: previous.key,
+      versionKey: previous.key,
+      kind: 'current',
+      previousKey: previous.key,
+      bytes: previous.size,
+      workspaceDigest,
+      archiveSha256: previous.customMetadata?.archiveSha256 || archiveSha256,
+      fileCount: currentFileCount,
+      totalBytes: Number.parseInt(totalBytes, 10) || 0,
+      skippedFileCount: Number.parseInt(skippedFileCount, 10) || 0,
+      archiveFormat: previous.customMetadata?.archiveFormat || archiveFormat,
+      deduplicated: true,
+      retainPrevious,
+      requestedKeyMissing: resolved.requestedKeyMissing,
+      deleted: cleanup.deleted,
+      deletedKeys: cleanup.deleted.map((item) => item.key),
+      cleanupFailed: cleanup.failed,
+    });
+  }
+
+  if (!response.body) {
+    throw new RuntimeOperationError(
+      502,
+      'archive_body_missing',
+      'archive.upload',
+      'Container returned an empty archive response'
+    );
+  }
+  const versionKey =
+    targetArchiveKey || archiveVersionKey(userId, sessionId, now);
+  if (versionObjects.some((object) => object.key === versionKey)) {
+    await response.body.cancel().catch(() => undefined);
+    throw new RuntimeOperationError(
+      409,
+      'target_archive_key_exists',
+      'archive.prepare',
+      'Target archive key already exists'
+    );
+  }
   const metadata = {
     userId,
     sessionId,
     workspaceDigest,
     archiveSha256,
     fileCount,
+    totalBytes,
     skippedFileCount,
     archiveFormat,
     archivedAt: now.toISOString(),
     versionKey,
   };
 
-  await env.WORKSPACE_ARCHIVES.put(versionKey, body, {
+  const stored = await env.WORKSPACE_ARCHIVES.put(versionKey, response.body, {
     httpMetadata: { contentType: 'application/gzip' },
     customMetadata: metadata,
   });
-
-  await env.WORKSPACE_ARCHIVES.put(key, body, {
-    httpMetadata: { contentType: 'application/gzip' },
-    customMetadata: metadata,
-  });
+  if (maxBytes !== null && stored.size > maxBytes) {
+    await env.WORKSPACE_ARCHIVES.delete(versionKey);
+    return json(
+      {
+        ok: false,
+        error: 'Workspace archive exceeds the reserved storage capacity',
+        code: 'archive_size_exceeded',
+        stage: 'archive.quota',
+        details: {
+          maxBytes,
+          actualBytes: stored.size,
+          currentKey: previous?.key || null,
+        },
+      },
+      { status: 413 }
+    );
+  }
+  const cleanup = await cleanupSessionArchives(
+    env.WORKSPACE_ARCHIVES,
+    userId,
+    sessionId,
+    versionKey,
+    [...versionObjects, stored],
+    {
+      now,
+      retainPrevious,
+      previousObject: previous,
+      retentionDays,
+      maxSnapshots,
+    }
+  );
 
   return json({
     ok: true,
-    key,
+    key: versionKey,
+    currentKey: versionKey,
     versionKey,
-    bytes: body.byteLength,
+    kind: 'current',
+    previousKey: previous?.key || null,
+    bytes: stored.size,
     workspaceDigest,
     archiveSha256,
     fileCount: currentFileCount,
+    totalBytes: Number.parseInt(totalBytes, 10) || 0,
     skippedFileCount: Number.parseInt(skippedFileCount, 10) || 0,
     archiveFormat,
+    deduplicated: false,
+    retainPrevious,
+    requestedKeyMissing: resolved.requestedKeyMissing,
+    deleted: cleanup.deleted,
+    deletedKeys: cleanup.deleted.map((item) => item.key),
+    cleanupFailed: cleanup.failed,
   });
 }
 
@@ -737,10 +1352,26 @@ async function restore(
   env: Env,
   origin: string,
   userId: string,
-  sessionId: string
+  sessionId: string,
+  requestedKey = ''
 ) {
-  const key = archiveKey(userId, sessionId);
-  const object = await env.WORKSPACE_ARCHIVES.get(key);
+  const resolved = await resolveCurrentArchiveObject(
+    env.WORKSPACE_ARCHIVES,
+    userId,
+    sessionId,
+    requestedKey
+  );
+  if (requestedKey && resolved.requestedKeyMissing) {
+    throw new RuntimeOperationError(
+      404,
+      'archive_not_found',
+      'restore.resolve',
+      'The requested workspace archive no longer exists',
+      { requestedKey }
+    );
+  }
+  const key = resolved.object?.key || '';
+  const object = key ? await env.WORKSPACE_ARCHIVES.get(key) : null;
   if (!object) {
     return json(
       {
@@ -748,8 +1379,11 @@ async function restore(
         error: 'Workspace archive was not found',
         code: 'archive_not_found',
         stage: 'restore.load',
-        details: { key },
-        key,
+        details: {
+          requestedKey: requestedKey || null,
+          legacyKey: legacyArchiveKey(userId, sessionId),
+        },
+        key: requestedKey || legacyArchiveKey(userId, sessionId),
       },
       { status: 404 }
     );
@@ -775,7 +1409,7 @@ async function restore(
   }
   const result = await containerJson<Manifest>(container(env, userId), target, {
     method: 'PUT',
-    body: await object.arrayBuffer(),
+    body: object.body,
     headers: restoreHeaders,
   });
 
@@ -786,17 +1420,218 @@ async function restore(
     objectMetadata: object.customMetadata,
     archiveFormat,
     legacyArchive: archiveFormat !== '2',
+    requestedKey: requestedKey || null,
+    requestedKeyMissing: resolved.requestedKeyMissing,
+    fallbackUsed: resolved.requestedKeyMissing,
     restored: result,
+  });
+}
+
+async function listManagedArchives(
+  env: Env,
+  userId: string,
+  sessionId: string,
+  url: URL
+) {
+  const prefix = sessionId
+    ? sessionArchivePrefix(userId, sessionId)
+    : userArchivePrefix(userId);
+  const page = await listArchiveObjectPage(env.WORKSPACE_ARCHIVES, prefix, {
+    cursor: url.searchParams.get('cursor') || undefined,
+    limit: archiveListLimit(url),
+  });
+  return json({
+    ok: true,
+    prefix,
+    objects: page.objects.map(archiveObjectJson),
+    truncated: page.truncated,
+    ...(page.cursor ? { cursor: page.cursor } : {}),
+  });
+}
+
+async function archiveStorageStats(env: Env, url: URL) {
+  const page = await listArchiveObjectPage(
+    env.WORKSPACE_ARCHIVES,
+    integratedWorkspacesPrefix,
+    {
+      cursor: url.searchParams.get('cursor') || undefined,
+      limit: archiveListLimit(url),
+    }
+  );
+  return json({
+    ok: true,
+    prefix: integratedWorkspacesPrefix,
+    objects: page.objects.length,
+    bytes: page.objects.reduce((total, object) => total + object.size, 0),
+    truncated: page.truncated,
+    ...(page.cursor ? { cursor: page.cursor } : {}),
+  });
+}
+
+async function deleteManagedArchives(
+  request: Request,
+  env: Env,
+  userId: string,
+  sessionId: string
+) {
+  let body: {
+    keys?: unknown;
+    scope?: unknown;
+    keepKey?: unknown;
+  };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json(
+      { ok: false, error: 'invalid_json', code: 'invalid_json' },
+      { status: 400 }
+    );
+  }
+
+  const rawKeys = body.keys;
+  const keys = Array.isArray(rawKeys)
+    ? rawKeys.filter((key): key is string => typeof key === 'string')
+    : [];
+  const hasKeysField = rawKeys !== undefined;
+  const hasKeys = Array.isArray(rawKeys);
+  const hasScopeField = body.scope !== undefined;
+  const hasKeepKey = body.keepKey !== undefined;
+  const scope =
+    body.scope === 'snapshots' || body.scope === 'all' ? body.scope : '';
+  if (
+    (hasKeysField && !hasKeys) ||
+    (Array.isArray(rawKeys) && keys.length !== rawKeys.length) ||
+    (hasKeys && keys.length === 0) ||
+    (hasKeys && keys.length > archiveDeleteKeyLimit) ||
+    (hasKeys && hasScopeField) ||
+    (hasKeys && hasKeepKey) ||
+    (hasScopeField && !scope) ||
+    (scope === 'all' && hasKeepKey) ||
+    (hasKeepKey && typeof body.keepKey !== 'string') ||
+    (!hasKeys && !scope)
+  ) {
+    return json(
+      {
+        ok: false,
+        error: 'Provide either valid keys or a supported scope',
+        code: 'invalid_archive_delete_request',
+        details: { maxKeys: archiveDeleteKeyLimit },
+      },
+      { status: 400 }
+    );
+  }
+
+  for (const key of keys) {
+    if (!isSessionArchiveKey(userId, sessionId, key)) {
+      return json(
+        {
+          ok: false,
+          error: 'Archive key is outside the requested session prefix',
+          code: 'invalid_archive_key',
+          details: { key },
+        },
+        { status: 400 }
+      );
+    }
+  }
+
+  let keptKey: string | null = null;
+  let notFound: string[] = [];
+  let candidates: Array<{
+    object: ArchiveObjectLike;
+    reason?: ArchiveDeletedObject['reason'];
+  }> = [];
+
+  if (hasKeys) {
+    const resolved = await Promise.all(
+      keys.map(async (key) => ({
+        key,
+        object: await env.WORKSPACE_ARCHIVES.head(key),
+      }))
+    );
+    notFound = resolved.filter((item) => !item.object).map((item) => item.key);
+    candidates = resolved
+      .filter(
+        (item): item is { key: string; object: R2Object } =>
+          item.object !== null
+      )
+      .map((item) => ({
+        object: archiveObjectSummary(item.object),
+        reason: 'explicit',
+      }));
+  } else if (scope === 'all') {
+    const objects = await listAllArchiveObjects(
+      env.WORKSPACE_ARCHIVES,
+      sessionArchivePrefix(userId, sessionId)
+    );
+    candidates = objects.map((object) => ({
+      object: archiveObjectSummary(object),
+      reason: 'all',
+    }));
+  } else {
+    const requestedKeepKey =
+      typeof body.keepKey === 'string' ? body.keepKey.trim() : '';
+    if (
+      requestedKeepKey &&
+      !isSessionArchiveKey(userId, sessionId, requestedKeepKey)
+    ) {
+      return json(
+        {
+          ok: false,
+          error: 'Keep key is outside the requested session prefix',
+          code: 'invalid_archive_key',
+          details: { key: requestedKeepKey },
+        },
+        { status: 400 }
+      );
+    }
+    const versions = await listAllArchiveObjects(
+      env.WORKSPACE_ARCHIVES,
+      archiveVersionsPrefix(userId, sessionId)
+    );
+    const resolved = await resolveCurrentArchiveObject(
+      env.WORKSPACE_ARCHIVES,
+      userId,
+      sessionId,
+      requestedKeepKey,
+      versions
+    );
+    keptKey = resolved.object?.key || null;
+    const temporary = await listAllArchiveObjects(
+      env.WORKSPACE_ARCHIVES,
+      archiveTemporaryPrefix(userId, sessionId)
+    );
+    const legacy = await env.WORKSPACE_ARCHIVES.head(
+      legacyArchiveKey(userId, sessionId)
+    );
+    candidates = [...versions, ...temporary, ...(legacy ? [legacy] : [])]
+      .filter((object) => object.key !== keptKey)
+      .map((object) => ({
+        object: archiveObjectSummary(object),
+        reason: 'snapshot',
+      }));
+  }
+
+  const result = await deleteArchiveObjects(env.WORKSPACE_ARCHIVES, candidates);
+  return json({
+    ok: result.failed.length === 0,
+    scope: scope || 'keys',
+    keptKey,
+    deleted: result.deleted,
+    deletedKeys: result.deleted.map((item) => item.key),
+    deletedBytes: result.deleted.reduce((total, item) => total + item.bytes, 0),
+    notFound,
+    failed: result.failed,
   });
 }
 
 function corsResponseHeaders(headers: HeadersInit = {}): Headers {
   const result = new Headers(headers);
   result.set('access-control-allow-origin', '*');
-  result.set('access-control-allow-methods', 'GET,POST,PUT,OPTIONS');
+  result.set('access-control-allow-methods', 'GET,POST,PUT,DELETE,OPTIONS');
   result.set(
     'access-control-allow-headers',
-    'authorization,content-type,x-api-key,anthropic-version,anthropic-beta,openai-organization,openai-project'
+    'authorization,content-type,x-api-key,anthropic-version,anthropic-beta,openai-organization,openai-project,x-hicode-runtime-secret,x-hicode-archive-key'
   );
   return result;
 }
@@ -946,7 +1781,7 @@ async function authorizeModelRequest(
   authorizationKey: string
 ): Promise<ModelAuthorizationResult> {
   if (!env.APP_BASE_URL || !env.BILLING_USAGE_WEBHOOK_SECRET) {
-    return { authorized: true };
+    throw new Error('Billing authorization is not configured');
   }
 
   const target = new URL(env.APP_BASE_URL);
@@ -960,6 +1795,7 @@ async function authorizeModelRequest(
     body: JSON.stringify({
       eventType: 'model_authorize',
       authorizationKey,
+      requestedModel: modelFromRequestBody(body),
       estimatedInputTokens: estimateInputTokens(body),
       maxOutputTokens: maxOutputTokens(body),
     }),
@@ -1003,7 +1839,7 @@ async function handleModelGateway(
 ): Promise<Response> {
   const { gatewayPath, sessionId } = gatewayContext(url);
 
-  if (gatewayPath === '/_health') {
+  if (url.pathname === `${gatewayBasePath}/_health`) {
     return json({
       ok: true,
       runtime: 'real-model-gateway',
@@ -1019,6 +1855,33 @@ async function handleModelGateway(
         'GET /v1/models/:model',
       ],
     });
+  }
+
+  if (!sessionId) {
+    return gatewayError(
+      401,
+      'A session-bound model gateway URL is required',
+      'codeagent_gateway_session_required'
+    );
+  }
+
+  try {
+    if (!(await modelGatewayAuthorized(request, env, sessionId))) {
+      return gatewayError(
+        401,
+        'Invalid model gateway session credential',
+        'codeagent_gateway_unauthorized'
+      );
+    }
+  } catch (error) {
+    if (error instanceof RuntimeOperationError) {
+      return gatewayError(error.status, error.message, error.code);
+    }
+    return gatewayError(
+      503,
+      'Model gateway session authentication is unavailable',
+      'codeagent_gateway_unavailable'
+    );
   }
 
   if (!apiKeyForGateway(env, gatewayPath)) {
@@ -1074,7 +1937,8 @@ async function handleModelGateway(
       const status =
         authorization.reason === 'insufficient_credits'
           ? 402
-          : authorization.reason === 'session_not_active'
+          : authorization.reason === 'session_not_active' ||
+              authorization.reason === 'model_mismatch'
             ? 409
             : 503;
       return gatewayError(
@@ -1243,9 +2107,9 @@ export default {
         status: 204,
         headers: {
           'access-control-allow-origin': '*',
-          'access-control-allow-methods': 'GET,POST,PUT,OPTIONS',
+          'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS',
           'access-control-allow-headers':
-            'authorization,content-type,x-api-key,anthropic-version,anthropic-beta,openai-organization,openai-project',
+            'authorization,content-type,x-api-key,anthropic-version,anthropic-beta,openai-organization,openai-project,x-hicode-runtime-secret,x-hicode-archive-key',
         },
       });
     }
@@ -1274,6 +2138,60 @@ export default {
       return handleModelGateway(request, env, url, ctx);
     }
 
+    if (url.pathname === '/archive-stats') {
+      if (!runtimeSecretAuthorized(request, env)) {
+        return json({ ok: false, error: 'unauthorized' }, { status: 401 });
+      }
+      if (request.method !== 'GET') {
+        return json(
+          { ok: false, error: 'method_not_allowed' },
+          { status: 405 }
+        );
+      }
+      try {
+        return await archiveStorageStats(env, url);
+      } catch (error) {
+        return runtimeErrorResponse(error, 'archive-stats');
+      }
+    }
+
+    const archiveManagementMatch = url.pathname.match(
+      /^\/archive-(list|delete)\/([^/]+)(?:\/([^/]+))?$/
+    );
+    if (archiveManagementMatch) {
+      if (!runtimeSecretAuthorized(request, env)) {
+        return json({ ok: false, error: 'unauthorized' }, { status: 401 });
+      }
+      const operation = archiveManagementMatch[1];
+      try {
+        const userId = decodeURIComponent(archiveManagementMatch[2]);
+        const sessionId = archiveManagementMatch[3]
+          ? decodeURIComponent(archiveManagementMatch[3])
+          : '';
+        if (operation === 'list') {
+          if (request.method !== 'GET') {
+            return json(
+              { ok: false, error: 'method_not_allowed' },
+              { status: 405 }
+            );
+          }
+          return await listManagedArchives(env, userId, sessionId, url);
+        }
+        if (request.method !== 'POST') {
+          return json(
+            { ok: false, error: 'method_not_allowed' },
+            { status: 405 }
+          );
+        }
+        if (!sessionId) {
+          return json({ ok: false, error: 'missing_session' }, { status: 400 });
+        }
+        return await deleteManagedArchives(request, env, userId, sessionId);
+      } catch (error) {
+        return runtimeErrorResponse(error, `archive-${operation}`);
+      }
+    }
+
     const actionMatch = url.pathname.match(
       /^\/(seed|inspect|archive|restore|clear|destroy|tmux|container-health)\/([^/]+)(?:\/([^/]+))?$/
     );
@@ -1287,17 +2205,46 @@ export default {
       const model = modelFromUrl(url);
       try {
         if (action === 'container-health') {
+          if (!runtimeSecretAuthorized(request, env)) {
+            return json({ ok: false, error: 'unauthorized' }, { status: 401 });
+          }
+          if (request.method !== 'GET') {
+            return json(
+              { ok: false, error: 'method_not_allowed' },
+              { status: 405 }
+            );
+          }
           const target = new URL(url.origin);
           target.pathname = '/health';
           return container(env, userId).fetch(
             new Request(target, {
               method: request.method,
-              headers: containerHeaders(request, env, agent, model),
+              headers: containerHeaders(request, agent, model),
             })
           );
         }
         if (!sessionId) {
           return json({ ok: false, error: 'missing_session' }, { status: 400 });
+        }
+        const mutatingAction =
+          action === 'seed' ||
+          action === 'archive' ||
+          action === 'restore' ||
+          action === 'clear' ||
+          action === 'destroy';
+        const readAction = action === 'inspect' || action === 'tmux';
+        const protectedAction = mutatingAction || readAction;
+        if (protectedAction && !runtimeSecretAuthorized(request, env)) {
+          return json({ ok: false, error: 'unauthorized' }, { status: 401 });
+        }
+        if (
+          (mutatingAction && request.method !== 'POST') ||
+          (readAction && request.method !== 'GET')
+        ) {
+          return json(
+            { ok: false, error: 'method_not_allowed' },
+            { status: 405 }
+          );
         }
         if (action === 'seed')
           return json(await seed(env, url.origin, userId, sessionId));
@@ -1330,10 +2277,37 @@ export default {
           return json(
             await tmuxStatus(env, url.origin, userId, sessionId, agent, model)
           );
-        if (action === 'archive')
-          return await archive(env, url.origin, userId, sessionId);
+        if (action === 'archive') {
+          const maxBytes = archiveMaxBytes(url, env);
+          if (maxBytes === null) {
+            throw new RuntimeOperationError(
+              400,
+              'archive_max_bytes_required',
+              'archive.quota',
+              'maxBytes is required for workspace archives'
+            );
+          }
+          return await archive(
+            env,
+            url.origin,
+            userId,
+            sessionId,
+            requestedArchiveKey(request, url),
+            requestedTargetArchiveKey(request),
+            url.searchParams.get('retainPrevious') !== '0',
+            maxBytes,
+            archiveRetentionDays(url),
+            archiveMaxSnapshots(url)
+          );
+        }
         if (action === 'restore')
-          return await restore(env, url.origin, userId, sessionId);
+          return await restore(
+            env,
+            url.origin,
+            userId,
+            sessionId,
+            requestedArchiveKey(request, url)
+          );
       } catch (error) {
         return runtimeErrorResponse(error, action);
       }
@@ -1343,11 +2317,7 @@ export default {
       /^\/files\/([^/]+)\/([^/]+)(?:\/(status|content))?$/
     );
     if (filesMatch) {
-      if (
-        !env.BILLING_USAGE_WEBHOOK_SECRET ||
-        request.headers.get('x-hicode-runtime-secret') !==
-          env.BILLING_USAGE_WEBHOOK_SECRET
-      ) {
+      if (!runtimeSecretAuthorized(request, env)) {
         return json({ ok: false, error: 'unauthorized' }, { status: 401 });
       }
       if (request.method !== 'GET') {
@@ -1375,6 +2345,9 @@ export default {
 
     const terminalMatch = url.pathname.match(/^\/terminal\/([^/]+)\/([^/]+)$/);
     if (terminalMatch) {
+      if (!runtimeSecretAuthorized(request, env)) {
+        return json({ ok: false, error: 'unauthorized' }, { status: 401 });
+      }
       const userId = decodeURIComponent(terminalMatch[1]);
       const sessionId = decodeURIComponent(terminalMatch[2]);
       const agent = agentFromUrl(url);
@@ -1386,39 +2359,60 @@ export default {
         `${url.origin}${gatewayBasePath}/session/${encodeURIComponent(sessionId)}`
       );
       withSessionParams(target, agent, model);
+      let gatewayToken: string;
+      try {
+        gatewayToken = await modelGatewaySessionToken(env, sessionId);
+      } catch (error) {
+        return runtimeErrorResponse(error, 'terminal');
+      }
       return container(env, userId).fetch(
         new Request(target, {
           method: request.method,
-          headers: containerHeaders(request, env, agent, model),
+          headers: containerHeaders(request, agent, model, gatewayToken),
           body: request.body,
         })
       );
     }
 
     const previewMatch = url.pathname.match(
-      /^\/preview\/([^/]+)\/([^/]+)(?:\/(.*))?$/
+      /^\/preview\/([^/]+)\/([^/]+)\/([^/]+)(?:\/(.*))?$/
     );
     if (previewMatch) {
       const userId = decodeURIComponent(previewMatch[1]);
       const sessionId = decodeURIComponent(previewMatch[2]);
-      const rest = previewMatch[3] || '';
-      const prefix = `/preview/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}/`;
+      const token = previewMatch[3];
+      const rest = previewMatch[4] || '';
+      if (
+        request.method !== 'GET' ||
+        !(await previewTokenAuthorized(env, userId, sessionId, token))
+      ) {
+        return json({ ok: false, error: 'not_found' }, { status: 404 });
+      }
+      const prefix = `/preview/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}/${encodeURIComponent(token)}/`;
       if (!url.pathname.endsWith('/') && rest === '') {
         return Response.redirect(`${url.origin}${prefix}${url.search}`, 302);
       }
       const target = new URL(request.url);
       target.pathname = `/preview/${encodeURIComponent(sessionId)}/${rest}`;
-      const headers = new Headers(request.headers);
+      const headers = new Headers();
       headers.set('x-codeagent-user', userId);
       headers.set('x-codeagent-session', sessionId);
-      return container(env, userId).fetch(
+      const response = await container(env, userId).fetch(
         new Request(target, {
-          method: request.method,
+          method: 'GET',
           headers,
-          body: request.body,
           redirect: request.redirect,
         })
       );
+      const responseHeaders = new Headers(response.headers);
+      responseHeaders.set('cache-control', 'private, no-store');
+      responseHeaders.set('referrer-policy', 'no-referrer');
+      responseHeaders.set('x-content-type-options', 'nosniff');
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
     }
 
     return json(
@@ -1450,6 +2444,19 @@ export default {
         })
         .catch((error) => {
           console.error('[billing-usage-outbox] flush failed', {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        })
+    );
+    ctx.waitUntil(
+      runStorageGcSchedule(env)
+        .then((result) => {
+          if (result.status !== 'deferred') {
+            console.info('[storage-gc]', result);
+          }
+        })
+        .catch((error) => {
+          console.error('[storage-gc] schedule failed', {
             message: error instanceof Error ? error.message : String(error),
           });
         })

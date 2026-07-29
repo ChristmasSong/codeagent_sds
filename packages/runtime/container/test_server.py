@@ -1,11 +1,14 @@
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+from urllib.parse import urlparse
 
 
 SERVER_PATH = Path(__file__).with_name("server.py")
@@ -28,6 +31,48 @@ class RecordingHandler:
 
     def end_headers(self):
         pass
+
+
+class AgentCredentialTests(unittest.TestCase):
+    def test_session_gateway_token_reaches_both_agent_environments(self):
+        fixture_credential = "test-only-session-gateway-credential"
+        claude = server.claude_process_env(
+            Path("/tmp/claude-home"),
+            Path("/tmp/claude-config"),
+            "https://runtime.example/api/model/session/s-1",
+            fixture_credential,
+        )
+        codex = server.codex_process_env(
+            Path("/tmp/codex-home"), fixture_credential
+        )
+
+        self.assertEqual(
+            claude["CODEAGENT_ANTHROPIC_API_KEY"], fixture_credential
+        )
+        self.assertEqual(codex["OPENAI_API_KEY"], fixture_credential)
+        self.assertNotIn("ANTHROPIC_API_KEY", claude)
+        self.assertNotIn("ANTHROPIC_API_KEY", codex)
+
+    def test_agent_router_passes_gateway_token_to_claude(self):
+        with mock.patch.object(
+            server,
+            "ensure_claude_tmux",
+            return_value=("claude-s-1", Path("/tmp/workspace")),
+        ) as ensure_claude:
+            server.ensure_agent_tmux(
+                "s-1",
+                "https://runtime.example/api/model/session/s-1",
+                "claude",
+                "cgw1_session-token",
+                "claude-sonnet",
+            )
+
+        ensure_claude.assert_called_once_with(
+            "s-1",
+            "https://runtime.example/api/model/session/s-1",
+            "claude-sonnet",
+            "cgw1_session-token",
+        )
 
 
 class WorkspaceArchiveTests(unittest.TestCase):
@@ -57,23 +102,38 @@ class WorkspaceArchiveTests(unittest.TestCase):
                 if member.isfile()
             }
 
+    def build_archive(self, max_bytes=None):
+        archive_file, manifest, archive_sha256, archive_size = (
+            server.make_archive(self.session_id, max_bytes)
+        )
+        try:
+            data = archive_file.read()
+        finally:
+            archive_file.close()
+        self.assertEqual(len(data), archive_size)
+        self.assertEqual(server.sha256_bytes(data), archive_sha256)
+        return data, manifest
+
     def test_archive_excludes_regenerable_dependencies(self):
         self.write("src/index.ts", b"export const value = 1;\n")
         self.write("node_modules/pkg/index.js", b"ignored\n")
         self.write(".next/cache/data.bin", b"ignored\n")
 
-        data, manifest = server.make_archive(self.session_id)
+        data, manifest = self.build_archive()
         entries = self.archive_entries(data)
 
         self.assertEqual(set(entries), {"src/index.ts"})
         self.assertEqual(manifest["file_count"], 1)
+        self.assertEqual(
+            manifest["total_bytes"], len(b"export const value = 1;\n")
+        )
         self.assertEqual(manifest["skipped_count"], 2)
 
     def test_manifest_digest_is_computed_from_archived_bytes(self):
         self.write("README.md", b"snapshot\n")
         self.write("src/main.js", b"console.log('snapshot');\n")
 
-        data, manifest = server.make_archive(self.session_id)
+        data, manifest = self.build_archive()
         entries = self.archive_entries(data)
         digest = hashlib.sha256()
         for path, content in sorted(entries.items()):
@@ -83,6 +143,132 @@ class WorkspaceArchiveTests(unittest.TestCase):
             digest.update(b"\0")
 
         self.assertEqual(manifest["digest"], digest.hexdigest())
+
+    def test_snapshot_and_manifest_do_not_buffer_whole_files(self):
+        self.write("large.bin", b"x" * (server.ARCHIVE_IO_CHUNK_BYTES + 7))
+
+        entries, skipped = server.snapshot_workspace(self.root)
+
+        self.assertEqual(skipped, [])
+        self.assertNotIn("data", entries[0])
+        self.assertEqual(entries[0]["size"], server.ARCHIVE_IO_CHUNK_BYTES + 7)
+        with mock.patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("whole-file read is not allowed"),
+        ):
+            manifest = server.manifest_from_entries(
+                self.session_id,
+                entries,
+                skipped,
+            )
+
+        self.assertEqual(
+            manifest["files"][0]["sha256"],
+            hashlib.sha256(b"x" * (server.ARCHIVE_IO_CHUNK_BYTES + 7)).hexdigest(),
+        )
+
+    def test_archive_uses_temp_file_without_whole_file_reads(self):
+        self.write("src/main.js", b"console.log('streamed');\n")
+
+        with mock.patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("whole-file read is not allowed"),
+        ):
+            data, manifest = self.build_archive()
+
+        self.assertEqual(
+            self.archive_entries(data)["src/main.js"],
+            b"console.log('streamed');\n",
+        )
+        self.assertEqual(manifest["file_count"], 1)
+
+    def test_archive_quota_rejects_from_stat_before_reading_contents(self):
+        oversized = self.root / "oversized.bin"
+        with oversized.open("wb") as file:
+            file.truncate(1025)
+
+        with mock.patch.object(
+            Path,
+            "open",
+            side_effect=AssertionError("content should not be opened"),
+        ):
+            with self.assertRaises(server.RuntimeOperationError) as raised:
+                server.make_archive(self.session_id, max_bytes=1024)
+
+        self.assertEqual(raised.exception.status, 413)
+        self.assertEqual(raised.exception.code, "archive_size_exceeded")
+        self.assertEqual(raised.exception.stage, "archive.quota")
+        self.assertEqual(raised.exception.details["maxBytes"], 1024)
+        self.assertEqual(raised.exception.details["actualBytes"], 1025)
+
+    def test_archive_query_max_bytes_validation(self):
+        self.assertEqual(
+            server.archive_max_bytes(
+                urlparse("/archive/session-test?maxBytes=123")
+            ),
+            123,
+        )
+        self.assertIsNone(
+            server.archive_max_bytes(urlparse("/archive/session-test"))
+        )
+        for value in ["", "-1", "1.5", "9007199254740992"]:
+            with self.subTest(value=value):
+                with self.assertRaises(
+                    server.RuntimeOperationError
+                ) as raised:
+                    server.archive_max_bytes(
+                        urlparse(
+                            f"/archive/session-test?maxBytes={value}"
+                        )
+                    )
+                self.assertEqual(raised.exception.status, 400)
+                self.assertEqual(
+                    raised.exception.code,
+                    "invalid_archive_max_bytes",
+                )
+
+    def test_archive_route_enforces_query_quota_before_file_reads(self):
+        oversized = self.root / "oversized.bin"
+        with oversized.open("wb") as file:
+            file.truncate(1025)
+        handler = RecordingHandler()
+        handler.path = f"/archive/{self.session_id}?maxBytes=1024"
+        handler.headers = {}
+
+        with mock.patch.object(
+            Path,
+            "open",
+            side_effect=AssertionError("content should not be opened"),
+        ):
+            server.Handler.do_GET(handler)
+
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertEqual(handler.status, 413)
+        self.assertEqual(payload["code"], "archive_size_exceeded")
+        self.assertEqual(payload["stage"], "archive.quota")
+
+    def test_archive_route_streams_compatible_gzip_response(self):
+        self.write("README.md", b"stream me\n")
+        handler = RecordingHandler()
+        handler.path = f"/archive/{self.session_id}?maxBytes=4096"
+        handler.headers = {}
+
+        server.Handler.do_GET(handler)
+
+        data = handler.wfile.getvalue()
+        self.assertEqual(handler.status, 200)
+        self.assertEqual(handler.headers["content-type"], "application/gzip")
+        self.assertEqual(int(handler.headers["content-length"]), len(data))
+        self.assertEqual(
+            handler.headers["x-archive-sha256"],
+            server.sha256_bytes(data),
+        )
+        self.assertEqual(
+            self.archive_entries(data),
+            {"README.md": b"stream me\n"},
+        )
 
     def test_successful_restore_replaces_workspace_after_validation(self):
         self.write("old.txt", b"old\n")
@@ -112,7 +298,7 @@ class WorkspaceArchiveTests(unittest.TestCase):
 
     def test_digest_failure_preserves_existing_workspace(self):
         self.write("old.txt", b"keep me\n")
-        data, _manifest = server.make_archive(self.session_id)
+        data, _manifest = self.build_archive()
 
         with self.assertRaises(server.RuntimeOperationError) as raised:
             server.restore_archive(
