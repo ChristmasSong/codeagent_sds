@@ -1,10 +1,23 @@
 import { useQuery } from '@tanstack/react-query';
 import { createFileRoute } from '@tanstack/react-router';
-import { Activity, CreditCard, Key, TrendingUp } from 'lucide-react';
+import {
+  ArrowRight,
+  CreditCard,
+  HardDrive,
+  Key,
+  TrendingUp,
+} from 'lucide-react';
 
 import { useSession } from '@/core/auth/client';
 import { m } from '@/core/i18n/messages';
+import { Link } from '@/core/i18n/navigation';
 import { apiGet } from '@/lib/api-client';
+import {
+  formatStorageBytes,
+  storagePercent,
+  type UserStorageResponse,
+} from '@/lib/storage-contract';
+import { cn } from '@/lib/utils';
 import {
   Card,
   CardContent,
@@ -12,6 +25,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
+import { Progress } from '@/components/ui/progress';
 
 type Subscription = {
   status: string;
@@ -35,10 +49,22 @@ function DashboardPage() {
     queryFn: () =>
       apiGet<Subscription | null>('/api/user/subscriptions/current'),
   });
+  const storageQuery = useQuery({
+    queryKey: ['user-storage'],
+    queryFn: () => apiGet<UserStorageResponse>('/api/storage'),
+    staleTime: 30_000,
+  });
 
   const credits = creditsData?.balance ?? null;
   const apiKeys = apiKeysData?.length ?? null;
   const subscription = subscriptionData ?? null;
+  const storageQuota = storageQuery.data?.quota;
+  const countedStorageBytes = storageQuota
+    ? storageQuota.usedBytes + storageQuota.reservedBytes
+    : 0;
+  const storageUsagePercent = storageQuota
+    ? storagePercent(countedStorageBytes, storageQuota.limitBytes)
+    : 0;
 
   const planLabel =
     subscription?.planName ||
@@ -107,15 +133,36 @@ function DashboardPage() {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium">
-              {m['settings.overview.usage']()}
+              {m['settings.overview.storage']()}
             </CardTitle>
-            <Activity className="text-muted-foreground size-4" />
+            <HardDrive className="text-muted-foreground size-4" />
           </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">0</div>
-            <p className="text-muted-foreground mt-1 text-xs">
-              {m['settings.overview.usage_description']()}
+          <CardContent className="space-y-3">
+            <div className="text-2xl font-bold tabular-nums">
+              {storageQuota ? `${Math.round(storageUsagePercent)}%` : '—'}
+            </div>
+            <Progress
+              value={storageUsagePercent}
+              aria-label={m['settings.overview.storage']()}
+              className={overviewStorageProgressClassName(storageUsagePercent)}
+            />
+            <p className="text-muted-foreground text-xs">
+              {storageQuota
+                ? m['settings.overview.storage_description']({
+                    used: formatStorageBytes(countedStorageBytes),
+                    limit: formatStorageBytes(storageQuota.limitBytes),
+                  })
+                : storageQuery.isError
+                  ? m['settings.storage.load_failed']()
+                  : m['settings.overview.storage_loading']()}
             </p>
+            <Link
+              href="/settings/storage"
+              className="text-primary inline-flex items-center gap-1 text-xs font-medium hover:underline"
+            >
+              {m['settings.storage.manage']()}
+              <ArrowRight className="size-3" />
+            </Link>
           </CardContent>
         </Card>
       </div>
@@ -142,3 +189,12 @@ function DashboardPage() {
 export const Route = createFileRoute('/settings/')({
   component: DashboardPage,
 });
+
+function overviewStorageProgressClassName(percent: number) {
+  return cn(
+    percent >= 100 && '[&_[data-slot=progress-indicator]]:bg-destructive',
+    percent >= 80 &&
+      percent < 100 &&
+      '[&_[data-slot=progress-indicator]]:bg-chart-4'
+  );
+}

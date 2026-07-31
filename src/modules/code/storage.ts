@@ -1357,6 +1357,12 @@ export async function getUsage(userId: string, configs: StorageConfigMap) {
       (total: number, row: StorageObject) => total + Number(row.sizeBytes),
       0
     );
+  const tempBytes = objects
+    .filter((row: StorageObject) => row.kind === 'temp')
+    .reduce(
+      (total: number, row: StorageObject) => total + Number(row.sizeBytes),
+      0
+    );
   return {
     usedBytes: Number(usage?.usedBytes ?? 0),
     reservedBytes: Number(usage?.reservedBytes ?? 0),
@@ -1367,6 +1373,7 @@ export async function getUsage(userId: string, configs: StorageConfigMap) {
         : Number(usage.quotaOverrideBytes),
     currentBytes,
     snapshotBytes,
+    tempBytes,
     pendingDeleteBytes: Number(usage?.pendingDeleteBytes ?? 0),
   };
 }

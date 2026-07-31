@@ -4,6 +4,7 @@ import { createFileRoute } from '@tanstack/react-router';
 import {
   AlertTriangle,
   Archive,
+  Box,
   Clock3,
   Database,
   HardDrive,
@@ -39,7 +40,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Progress, ProgressLabel } from '@/components/ui/progress';
+import {
+  Progress,
+  ProgressLabel,
+  ProgressValue,
+} from '@/components/ui/progress';
 import { Skeleton } from '@/components/ui/skeleton';
 
 type CleanupTarget =
@@ -67,6 +72,7 @@ function StoragePage() {
   const storageQuery = useQuery({
     queryKey: ['user-storage'],
     queryFn: () => apiGet<UserStorageResponse>('/api/storage'),
+    staleTime: 30_000,
   });
 
   const cleanupMutation = useMutation({
@@ -105,9 +111,12 @@ function StoragePage() {
 
   const data = storageQuery.data;
   const quota = data?.quota;
-  const usedAndReserved = quota ? quota.usedBytes + quota.reservedBytes : 0;
+  const countedBytes = quota ? quota.usedBytes + quota.reservedBytes : 0;
   const usagePercent = quota
-    ? storagePercent(usedAndReserved, quota.limitBytes)
+    ? storagePercent(countedBytes, quota.limitBytes)
+    : 0;
+  const availableBytes = quota
+    ? Math.max(0, quota.limitBytes - countedBytes)
     : 0;
   const snapshotCount =
     data?.sessions.reduce(
@@ -174,70 +183,89 @@ function StoragePage() {
               </CardDescription>
               <CardAction>
                 <Badge variant={usageBadgeVariant(usagePercent)}>
-                  {Math.round(usagePercent)}%
+                  {usageStatusLabel(usagePercent)} · {Math.round(usagePercent)}%
                 </Badge>
               </CardAction>
             </CardHeader>
-            <CardContent className="space-y-5">
-              <Progress
-                value={usagePercent}
-                className={progressClassName(usagePercent)}
-              >
-                <ProgressLabel>
-                  {formatStorageBytes(quota.usedBytes)}
-                  <span className="text-muted-foreground font-normal">
-                    {' '}
-                    / {formatStorageBytes(quota.limitBytes)}
-                  </span>
-                </ProgressLabel>
-                <span className="text-muted-foreground ml-auto text-sm tabular-nums">
-                  {m['settings.storage.available']({
-                    amount: formatStorageBytes(
-                      Math.max(0, quota.limitBytes - usedAndReserved)
-                    ),
-                  })}
-                </span>
-              </Progress>
+            <CardContent>
+              <div className="grid gap-7 lg:grid-cols-[12rem_minmax(0,1fr)] lg:items-center">
+                <QuotaGauge
+                  percent={usagePercent}
+                  countedBytes={countedBytes}
+                  limitBytes={quota.limitBytes}
+                />
 
-              {usagePercent >= 80 ? (
-                <div
-                  className={cn(
-                    'flex gap-3 rounded-lg border p-3 text-sm',
-                    usagePercent >= 100
-                      ? 'border-destructive/30 bg-destructive/5 text-destructive'
-                      : 'border-chart-4/40 bg-chart-4/10'
-                  )}
-                >
-                  <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-                  <p>
-                    {usagePercent >= 100
-                      ? m['settings.storage.limit_reached']()
-                      : m['settings.storage.limit_warning']()}
+                <div className="space-y-5">
+                  <Progress
+                    value={usagePercent}
+                    className={progressClassName(usagePercent)}
+                  >
+                    <ProgressLabel>
+                      {m['settings.storage.usage_of_limit']({
+                        used: formatStorageBytes(countedBytes),
+                        limit: formatStorageBytes(quota.limitBytes),
+                      })}
+                    </ProgressLabel>
+                    <ProgressValue>
+                      {() =>
+                        m['settings.storage.available']({
+                          amount: formatStorageBytes(availableBytes),
+                        })
+                      }
+                    </ProgressValue>
+                  </Progress>
+
+                  {usagePercent >= 80 ? (
+                    <div
+                      className={cn(
+                        'flex gap-3 rounded-lg border p-3 text-sm',
+                        usagePercent >= 100
+                          ? 'border-destructive/30 bg-destructive/5 text-destructive'
+                          : 'border-chart-4/40 bg-chart-4/10'
+                      )}
+                      role="alert"
+                    >
+                      <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                      <p>
+                        {usagePercent >= 100
+                          ? m['settings.storage.limit_reached']()
+                          : m['settings.storage.limit_warning']()}
+                      </p>
+                    </div>
+                  ) : null}
+
+                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                    <UsageMetric
+                      icon={Database}
+                      label={m['settings.storage.current_usage']()}
+                      value={formatStorageBytes(quota.currentBytes)}
+                    />
+                    <UsageMetric
+                      icon={Archive}
+                      label={m['settings.storage.snapshot_usage']()}
+                      value={formatStorageBytes(quota.snapshotBytes)}
+                    />
+                    <UsageMetric
+                      icon={Box}
+                      label={m['settings.storage.temp_usage']()}
+                      value={formatStorageBytes(quota.tempBytes)}
+                    />
+                    <UsageMetric
+                      icon={Clock3}
+                      label={m['settings.storage.reserved_usage']()}
+                      value={formatStorageBytes(quota.reservedBytes)}
+                    />
+                    <UsageMetric
+                      icon={Trash2}
+                      label={m['settings.storage.pending_delete']()}
+                      value={formatStorageBytes(quota.pendingDeleteBytes ?? 0)}
+                    />
+                  </div>
+
+                  <p className="text-muted-foreground text-xs">
+                    {m['settings.storage.pending_release_hint']()}
                   </p>
                 </div>
-              ) : null}
-
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                <UsageMetric
-                  icon={Database}
-                  label={m['settings.storage.current_usage']()}
-                  value={formatStorageBytes(quota.currentBytes)}
-                />
-                <UsageMetric
-                  icon={Archive}
-                  label={m['settings.storage.snapshot_usage']()}
-                  value={formatStorageBytes(quota.snapshotBytes)}
-                />
-                <UsageMetric
-                  icon={Clock3}
-                  label={m['settings.storage.reserved_usage']()}
-                  value={formatStorageBytes(quota.reservedBytes)}
-                />
-                <UsageMetric
-                  icon={Trash2}
-                  label={m['settings.storage.pending_delete']()}
-                  value={formatStorageBytes(quota.pendingDeleteBytes ?? 0)}
-                />
               </div>
             </CardContent>
           </Card>
@@ -356,6 +384,72 @@ function StoragePage() {
   );
 }
 
+function QuotaGauge({
+  percent,
+  countedBytes,
+  limitBytes,
+}: {
+  percent: number;
+  countedBytes: number;
+  limitBytes: number;
+}) {
+  const clampedPercent = Math.min(100, Math.max(0, percent));
+  const label = m['settings.storage.usage_of_limit']({
+    used: formatStorageBytes(countedBytes),
+    limit: formatStorageBytes(limitBytes),
+  });
+
+  return (
+    <div className="flex flex-col items-center gap-3 text-center">
+      <div
+        className="relative size-36"
+        role="img"
+        aria-label={`${label}, ${Math.round(percent)}%`}
+      >
+        <svg
+          className="size-full -rotate-90"
+          viewBox="0 0 120 120"
+          aria-hidden="true"
+        >
+          <circle
+            className="stroke-muted"
+            cx="60"
+            cy="60"
+            r="50"
+            fill="none"
+            strokeWidth="10"
+          />
+          {clampedPercent > 0 ? (
+            <circle
+              className={cn(
+                'stroke-current transition-[stroke-dasharray] duration-500',
+                gaugeToneClassName(percent)
+              )}
+              cx="60"
+              cy="60"
+              r="50"
+              fill="none"
+              pathLength="100"
+              strokeDasharray={`${clampedPercent} ${100 - clampedPercent}`}
+              strokeLinecap="round"
+              strokeWidth="10"
+            />
+          ) : null}
+        </svg>
+        <div className="absolute inset-0 flex flex-col items-center justify-center">
+          <span className="text-3xl font-bold tracking-tight tabular-nums">
+            {Math.round(percent)}%
+          </span>
+          <span className="text-muted-foreground mt-0.5 text-xs">
+            {m['settings.storage.counted_usage']()}
+          </span>
+        </div>
+      </div>
+      <p className="text-muted-foreground text-xs">{label}</p>
+    </div>
+  );
+}
+
 function UsageMetric({
   icon: Icon,
   label,
@@ -407,7 +501,9 @@ function StorageObjectRow({
               {formatStorageBytes(object.sizeBytes)}
             </Badge>
             {object.status !== 'active' ? (
-              <Badge variant="outline">{object.status}</Badge>
+              <Badge variant="outline">
+                {storageObjectStatusLabel(object.status)}
+              </Badge>
             ) : null}
           </div>
           <p className="text-muted-foreground mt-1 text-xs">
@@ -500,12 +596,18 @@ function StoragePageSkeleton() {
           <Skeleton className="h-5 w-44" />
           <Skeleton className="h-4 w-72 max-w-full" />
         </CardHeader>
-        <CardContent className="space-y-5">
-          <Skeleton className="h-8 w-full" />
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            {Array.from({ length: 4 }).map((_, index) => (
-              <Skeleton key={index} className="h-16 w-full" />
-            ))}
+        <CardContent>
+          <div className="grid gap-7 lg:grid-cols-[12rem_minmax(0,1fr)] lg:items-center">
+            <Skeleton className="size-36 justify-self-center rounded-full" />
+            <div className="space-y-5">
+              <Skeleton className="h-8 w-full" />
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                {Array.from({ length: 5 }).map((_, index) => (
+                  <Skeleton key={index} className="h-16 w-full" />
+                ))}
+              </div>
+              <Skeleton className="h-3 w-4/5" />
+            </div>
           </div>
         </CardContent>
       </Card>
@@ -529,6 +631,33 @@ function progressClassName(percent: number) {
     return '[&_[data-slot=progress-indicator]]:bg-chart-4';
   }
   return '';
+}
+
+function gaugeToneClassName(percent: number) {
+  if (percent >= 100) return 'text-destructive';
+  if (percent >= 80) return 'text-chart-4';
+  return 'text-primary';
+}
+
+function usageStatusLabel(percent: number) {
+  if (percent >= 100) return m['settings.storage.status_reached']();
+  if (percent >= 80) return m['settings.storage.status_warning']();
+  return m['settings.storage.status_available']();
+}
+
+function storageObjectStatusLabel(status: string) {
+  switch (status) {
+    case 'active':
+      return m['settings.storage.status_active']();
+    case 'deleting':
+      return m['settings.storage.status_deleting']();
+    case 'pending':
+      return m['settings.storage.status_pending']();
+    case 'failed':
+      return m['settings.storage.status_failed']();
+    default:
+      return status;
+  }
 }
 
 function formatDateTime(value: string) {

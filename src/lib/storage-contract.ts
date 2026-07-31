@@ -29,6 +29,7 @@ export interface StorageQuotaSummary {
   limitBytes: number;
   currentBytes: number;
   snapshotBytes: number;
+  tempBytes: number;
   pendingDeleteBytes?: number;
 }
 
