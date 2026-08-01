@@ -15,6 +15,7 @@ interface RuntimeDirectoryPayload {
   path?: string;
   entries?: WorkspaceDirectoryResult['entries'];
   truncated?: boolean;
+  code?: string;
   error?: string;
 }
 
@@ -24,6 +25,7 @@ interface RuntimeStatusPayload {
   digest?: string | null;
   entryCount?: number;
   truncated?: boolean;
+  code?: string;
   error?: string;
 }
 
@@ -43,11 +45,39 @@ interface RuntimeFileContentPayload {
   tooLarge?: boolean;
   truncated?: boolean;
   content?: string;
+  code?: string;
   error?: string;
+}
+
+export interface WorkspaceFileUploadResult {
+  path: string;
+  name: string;
+  size: number;
+  mtime: string;
+  etag: string;
+  mimeType: string;
+  kind: string;
+  overwritten: boolean;
+  workspaceBytes: number;
+  workspaceMaxBytes: number;
+}
+
+interface RuntimeFileUploadPayload extends Partial<WorkspaceFileUploadResult> {
+  ok?: boolean;
+  code?: string;
+  error?: string;
+}
+
+export interface RuntimeRequestOptions {
+  method?: string;
+  headers?: HeadersInit;
+  body?: BodyInit | null;
 }
 
 const RUNTIME_FILES_TIMEOUT_MS = 15_000;
 const RUNTIME_FILE_STREAM_TIMEOUT_MS = 60_000;
+const RUNTIME_FILE_UPLOAD_TIMEOUT_MS = 10 * 60_000;
+const RUNTIME_WORKSPACE_DOWNLOAD_TIMEOUT_MS = 30 * 60_000;
 const RUNTIME_JSON_RESPONSE_LIMIT = 8 * 1024 * 1024;
 const RAW_PREVIEW_LIMITS: Partial<Record<WorkspaceFilePreviewKind, number>> = {
   image: 10 * 1024 * 1024,
@@ -67,6 +97,12 @@ const FORWARDED_RAW_HEADERS = [
   'x-file-path',
   'x-file-preview-kind',
   'x-file-size',
+] as const;
+const FORWARDED_UPLOAD_HEADERS = [
+  'content-length',
+  'content-type',
+  'if-match',
+  'if-none-match',
 ] as const;
 
 export type WorkspaceRuntimeSecretResolver = (options?: {
@@ -92,6 +128,25 @@ function normalizeWorkspacePath(value: unknown): string {
   return path;
 }
 
+export function assertSameOriginRequest(request: Request): void {
+  const origin = request.headers.get('origin');
+  if (!origin || origin === 'null') {
+    throw new WorkspaceFilesError('invalid_origin', 403);
+  }
+  try {
+    const parsedOrigin = new URL(origin);
+    if (
+      origin !== parsedOrigin.origin ||
+      parsedOrigin.origin !== new URL(request.url).origin
+    ) {
+      throw new WorkspaceFilesError('invalid_origin', 403);
+    }
+  } catch (error) {
+    if (error instanceof WorkspaceFilesError) throw error;
+    throw new WorkspaceFilesError('invalid_origin', 403);
+  }
+}
+
 function runtimeError(error: unknown): WorkspaceFilesError {
   if (error instanceof WorkspaceFilesError) return error;
   if (
@@ -109,17 +164,41 @@ function runtimePayloadError(
 ): WorkspaceFilesError {
   const code = error || 'runtime_request_failed';
   const knownStatus: Record<string, number> = {
+    content_length_required: 411,
+    etag_mismatch: 412,
+    export_archive_size_exceeded: 413,
+    export_file_limit_exceeded: 413,
+    export_size_exceeded: 413,
+    file_already_exists: 409,
     file_not_available: 404,
     file_read_failed: 502,
     file_too_large: 413,
     invalid_path: 400,
+    invalid_upload_precondition: 400,
+    invalid_workspace_max_bytes: 400,
     not_a_file: 400,
+    unsupported_file_type: 415,
     unsupported_file: 415,
+    upload_incomplete: 400,
+    workspace_changed_during_export: 409,
+    workspace_not_found: 404,
+    workspace_size_exceeded: 413,
+    workspace_transfer_busy: 429,
   };
   return new WorkspaceFilesError(
     Object.hasOwn(knownStatus, code) ? code : 'runtime_request_failed',
     knownStatus[code] || (status >= 400 && status < 500 ? status : 502)
   );
+}
+
+export function workspaceRuntimePayloadError(
+  payload: { code?: string; error?: string },
+  status: number
+): WorkspaceFilesError {
+  // RuntimeOperationError uses `code` for the stable machine value and
+  // `error` for a human-readable message. Older preview endpoints put the
+  // machine value in `error`, so retain that as a compatibility fallback.
+  return runtimePayloadError(payload.code || payload.error, status);
 }
 
 async function readRuntimeJson<T>(response: Response): Promise<T> {
@@ -185,27 +264,42 @@ export async function requestRuntimeWithSecret(
   url: string,
   resolveSecret: WorkspaceRuntimeSecretResolver,
   timeoutMs: number,
-  headers?: HeadersInit
+  options: RuntimeRequestOptions = {}
 ): Promise<Response> {
+  const method = options.method || 'GET';
+  const hasBody = options.body != null;
   const request = async (secret: string) => {
-    const requestHeaders = new Headers(headers);
+    const requestHeaders = new Headers(options.headers);
     requestHeaders.set('x-hicode-runtime-secret', secret);
+    const init: RequestInit & { duplex?: 'half' } = {
+      method,
+      headers: requestHeaders,
+      signal: AbortSignal.timeout(timeoutMs),
+    };
+    if (hasBody) {
+      init.body = options.body;
+      // Required by Node's fetch for streamed request bodies. Other Fetch
+      // implementations safely ignore this standardizing extension.
+      init.duplex = 'half';
+    }
     try {
-      return await fetch(url, {
-        method: 'GET',
-        headers: requestHeaders,
-        signal: AbortSignal.timeout(timeoutMs),
-      });
+      return await fetch(url, init);
     } catch (error) {
       throw runtimeError(error);
     }
   };
 
-  let response = await request(await runtimeSecret(resolveSecret));
+  // A ReadableStream cannot be replayed without buffering it. Resolve a fresh
+  // secret before streaming a body so a stale-cache retry never consumes the
+  // user's upload twice or retains the complete file in App memory.
+  let response = await request(await runtimeSecret(resolveSecret, hasBody));
   if (response.status !== 401) return response;
 
   // The Runtime uses 401 specifically for a stale/mismatched shared secret.
   await response.body?.cancel().catch(() => undefined);
+  if (hasBody) {
+    throw new WorkspaceFilesError('runtime_not_configured', 503);
+  }
   response = await request(await runtimeSecret(resolveSecret, true));
   if (response.status === 401) {
     await response.body?.cancel().catch(() => undefined);
@@ -220,23 +314,52 @@ async function runtimeFilesRequest<T>(
 ): Promise<T> {
   let payload: T & {
     ok?: boolean;
+    code?: string;
     error?: string;
   };
   const response = await requestRuntimeWithSecret(
     url,
     resolveSecret,
     RUNTIME_FILES_TIMEOUT_MS,
-    { accept: 'application/json' }
+    { headers: { accept: 'application/json' } }
   );
   try {
-    payload = await readRuntimeJson<T & { ok?: boolean; error?: string }>(
-      response
-    );
+    payload = await readRuntimeJson<
+      T & { ok?: boolean; code?: string; error?: string }
+    >(response);
   } catch (error) {
     throw runtimeError(error);
   }
   if (!response.ok || payload.ok === false) {
-    throw runtimePayloadError(payload.error, response.status);
+    throw workspaceRuntimePayloadError(payload, response.status);
+  }
+  return payload;
+}
+
+async function runtimeUploadRequest(
+  url: string,
+  body: BodyInit,
+  headers: HeadersInit,
+  resolveSecret: WorkspaceRuntimeSecretResolver
+): Promise<RuntimeFileUploadPayload> {
+  const response = await requestRuntimeWithSecret(
+    url,
+    resolveSecret,
+    RUNTIME_FILE_UPLOAD_TIMEOUT_MS,
+    {
+      method: 'PUT',
+      headers,
+      body,
+    }
+  );
+  let payload: RuntimeFileUploadPayload;
+  try {
+    payload = await readRuntimeJson<RuntimeFileUploadPayload>(response);
+  } catch (error) {
+    throw runtimeError(error);
+  }
+  if (!response.ok || payload.ok === false) {
+    throw workspaceRuntimePayloadError(payload, response.status);
   }
   return payload;
 }
@@ -252,9 +375,10 @@ async function runtimeFileResponse(
   );
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as {
+      code?: string;
       error?: string;
     };
-    throw runtimePayloadError(payload.error, response.status);
+    throw workspaceRuntimePayloadError(payload, response.status);
   }
   return response;
 }
@@ -263,6 +387,84 @@ async function ownedActiveSession(userId: string, sessionId: string) {
   const session = await getOwnedSession(userId, sessionId);
   if (!session) throw new WorkspaceFilesError('session_not_found', 404);
   return session;
+}
+
+function requiredActiveSession<T extends { status: string }>(session: T): T {
+  if (session.status !== 'active') {
+    throw new WorkspaceFilesError('session_not_active', 409);
+  }
+  return session;
+}
+
+export function buildWorkspaceUploadHeaders(
+  requestHeaders: HeadersInit,
+  workspaceMaxBytes: number
+): Headers {
+  if (!Number.isSafeInteger(workspaceMaxBytes) || workspaceMaxBytes <= 0) {
+    throw new WorkspaceFilesError('invalid_workspace_quota', 500);
+  }
+  const source = new Headers(requestHeaders);
+  const headers = new Headers({ accept: 'application/json' });
+  for (const name of FORWARDED_UPLOAD_HEADERS) {
+    const value = source.get(name);
+    if (value) headers.set(name, value);
+  }
+  // Never forward this internal limit from the browser. The App is the sole
+  // authority for the configured workspace quota.
+  headers.set('x-workspace-max-bytes', String(workspaceMaxBytes));
+  return headers;
+}
+
+function validZipContentDisposition(value: string): boolean {
+  return /^attachment(?:\s*;|\s*$)/i.test(value);
+}
+
+function validatedOptionalContentLength(value: string | null): string | null {
+  if (value == null) return null;
+  if (!/^(?:0|[1-9]\d*)$/.test(value)) {
+    throw new WorkspaceFilesError('invalid_runtime_download_response', 502);
+  }
+  const length = Number(value);
+  if (!Number.isSafeInteger(length) || length < 0) {
+    throw new WorkspaceFilesError('invalid_runtime_download_response', 502);
+  }
+  return value;
+}
+
+export async function createWorkspaceDownloadResponse(
+  response: Response
+): Promise<Response> {
+  const contentType = (response.headers.get('content-type') || '')
+    .split(';', 1)[0]
+    .trim()
+    .toLowerCase();
+  const contentDisposition = response.headers.get('content-disposition') || '';
+  let contentLength: string | null;
+  try {
+    contentLength = validatedOptionalContentLength(
+      response.headers.get('content-length')
+    );
+  } catch (error) {
+    await response.body?.cancel().catch(() => undefined);
+    throw error;
+  }
+  if (
+    contentType !== 'application/zip' ||
+    !validZipContentDisposition(contentDisposition) ||
+    !response.body
+  ) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new WorkspaceFilesError('invalid_runtime_download_response', 502);
+  }
+
+  const headers = new Headers({
+    'cache-control': 'private, no-store',
+    'content-disposition': contentDisposition,
+    'content-type': 'application/zip',
+    'x-content-type-options': 'nosniff',
+  });
+  if (contentLength != null) headers.set('content-length', contentLength);
+  return new Response(response.body, { status: 200, headers });
 }
 
 function contentUrl(
@@ -482,4 +684,104 @@ export async function getWorkspaceFileRawResponse(
     status: 200,
     headers,
   });
+}
+
+export async function uploadWorkspaceFile(
+  userId: string,
+  sessionId: string,
+  requestedPath: unknown,
+  body: BodyInit | null,
+  requestHeaders: HeadersInit,
+  workspaceMaxBytes: number,
+  resolveSecret: WorkspaceRuntimeSecretResolver
+): Promise<WorkspaceFileUploadResult> {
+  const session = requiredActiveSession(
+    await ownedActiveSession(userId, sessionId)
+  );
+  const path = normalizeWorkspacePath(requestedPath);
+  if (!path) throw new WorkspaceFilesError('invalid_path', 400);
+  if (body == null) throw new WorkspaceFilesError('file_required', 400);
+
+  const url = new URL(
+    workspaceFilesUrl(
+      envConfigs.runtime_base_url,
+      session.runtimeUserId,
+      session.id,
+      'upload'
+    )
+  );
+  url.searchParams.set('path', path);
+  const payload = await runtimeUploadRequest(
+    url.toString(),
+    body,
+    buildWorkspaceUploadHeaders(requestHeaders, workspaceMaxBytes),
+    resolveSecret
+  );
+
+  if (
+    typeof payload.path !== 'string' ||
+    typeof payload.name !== 'string' ||
+    typeof payload.size !== 'number' ||
+    !Number.isSafeInteger(payload.size) ||
+    payload.size < 0 ||
+    typeof payload.mtime !== 'string' ||
+    typeof payload.etag !== 'string' ||
+    typeof payload.mimeType !== 'string' ||
+    typeof payload.kind !== 'string' ||
+    typeof payload.overwritten !== 'boolean' ||
+    typeof payload.workspaceBytes !== 'number' ||
+    !Number.isSafeInteger(payload.workspaceBytes) ||
+    payload.workspaceBytes < 0 ||
+    typeof payload.workspaceMaxBytes !== 'number' ||
+    !Number.isSafeInteger(payload.workspaceMaxBytes) ||
+    payload.workspaceMaxBytes !== workspaceMaxBytes
+  ) {
+    throw new WorkspaceFilesError('invalid_runtime_response', 502);
+  }
+  return {
+    path: payload.path,
+    name: payload.name,
+    size: payload.size,
+    mtime: payload.mtime,
+    etag: payload.etag,
+    mimeType: payload.mimeType,
+    kind: payload.kind,
+    overwritten: payload.overwritten,
+    workspaceBytes: payload.workspaceBytes,
+    workspaceMaxBytes: payload.workspaceMaxBytes,
+  };
+}
+
+export async function getWorkspaceDownloadAllResponse(
+  userId: string,
+  sessionId: string,
+  resolveSecret: WorkspaceRuntimeSecretResolver
+): Promise<Response> {
+  const session = requiredActiveSession(
+    await ownedActiveSession(userId, sessionId)
+  );
+  const response = await requestRuntimeWithSecret(
+    workspaceFilesUrl(
+      envConfigs.runtime_base_url,
+      session.runtimeUserId,
+      session.id,
+      'download-all'
+    ),
+    resolveSecret,
+    RUNTIME_WORKSPACE_DOWNLOAD_TIMEOUT_MS,
+    { headers: { accept: 'application/zip' } }
+  );
+  if (!response.ok) {
+    let payload: { code?: string; error?: string };
+    try {
+      payload = await readRuntimeJson<{ code?: string; error?: string }>(
+        response
+      );
+    } catch (error) {
+      throw runtimeError(error);
+    }
+    throw workspaceRuntimePayloadError(payload, response.status);
+  }
+
+  return createWorkspaceDownloadResponse(response);
 }

@@ -113,7 +113,7 @@ export function workspaceFilesUrl(
   base: string,
   userId: string,
   sessionId: string,
-  operation?: 'status' | 'content'
+  operation?: 'status' | 'content' | 'upload' | 'download-all'
 ): string {
   const suffix = operation ? `/${operation}` : '';
   return `${trimSlashes(base)}/files/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}${suffix}`;

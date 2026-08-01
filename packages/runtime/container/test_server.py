@@ -6,6 +6,7 @@ import os
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlparse
@@ -544,6 +545,310 @@ class WorkspaceFilesTest(unittest.TestCase):
         self.assertNotIn(
             str(self.workspace), "\n".join(handler.headers.values())
         )
+
+    def office_document(self, required_entry: str, include_macro=False):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, mode="w") as document:
+            document.writestr(
+                "[Content_Types].xml",
+                b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+            )
+            document.writestr(required_entry, b"<document />")
+            if include_macro:
+                document.writestr("word/vbaProject.bin", b"macro")
+        return output.getvalue()
+
+    def upload(self, path: str, data: bytes, **kwargs):
+        return server.upload_workspace_file(
+            "session-1",
+            path,
+            io.BytesIO(data),
+            len(data),
+            **kwargs,
+        )
+
+    def test_uploads_supported_images_documents_and_utf8_text(self):
+        fixtures = {
+            "src/image.png": b"\x89PNG\r\n\x1a\nimage",
+            "src/image.jpg": b"\xff\xd8\xffimage",
+            "src/image.webp": b"RIFF\x04\x00\x00\x00WEBPdata",
+            "src/image.gif": b"GIF89aimage",
+            "src/report.pdf": b"%PDF-1.7\nbody",
+            "src/report.docx": self.office_document("word/document.xml"),
+            "src/report.xlsx": self.office_document("xl/workbook.xml"),
+            "src/report.pptx": self.office_document("ppt/presentation.xml"),
+            "src/notes.txt": "你好，sandbox\n".encode(),
+            "src/config.unknown": b"plain UTF-8 text\n",
+        }
+
+        for path, data in fixtures.items():
+            with self.subTest(path=path):
+                result = self.upload(path, data, if_none_match="*")
+                self.assertEqual((self.workspace / path).read_bytes(), data)
+                self.assertEqual(result["path"], path)
+                self.assertEqual(result["size"], len(data))
+                self.assertEqual(len(result["etag"]), 64)
+                self.assertFalse(result["overwritten"])
+
+        self.assertEqual(
+            server.workspace_file_preview("session-1", "src/notes.txt")["content"],
+            "你好，sandbox\n",
+        )
+
+    def test_upload_rejects_disguised_binary_macro_and_invalid_text(self):
+        fixtures = {
+            "src/fake.png": b"not actually an image",
+            "src/binary.bin": b"\xff\xfe\x00binary",
+            "src/nul.txt": b"text\x00with nul",
+            "src/archive.gz": b"plain text with an archive suffix",
+            "src/archive.zip": self.office_document("word/document.xml"),
+            "src/macro.docx": self.office_document(
+                "word/document.xml", include_macro=True
+            ),
+        }
+
+        for path, data in fixtures.items():
+            with self.subTest(path=path):
+                with self.assertRaises(server.RuntimeOperationError) as raised:
+                    self.upload(path, data)
+                self.assertEqual(raised.exception.code, "unsupported_file_type")
+                self.assertEqual(raised.exception.status, 415)
+                self.assertFalse((self.workspace / path).exists())
+
+        self.assertEqual(
+            list(self.workspace.rglob(f"{server.UPLOAD_TEMP_PREFIX}*")), []
+        )
+
+    def test_office_upload_rejects_entry_bomb_before_zip_parsing(self):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, mode="w") as document:
+            for index in range(server.MAX_OFFICE_ZIP_ENTRIES + 1):
+                document.writestr(f"entry-{index}", b"")
+        payload = bytearray(output.getvalue())
+        eocd_index = payload.rfind(b"PK\x05\x06")
+        self.assertGreaterEqual(eocd_index, 0)
+        # Lie about both EOCD entry counts. The preflight must count actual
+        # central-directory records instead of trusting these fields.
+        server.struct.pack_into("<HH", payload, eocd_index + 8, 1, 1)
+
+        with tempfile.TemporaryFile(mode="w+b") as source:
+            source.write(payload)
+            source.flush()
+            with mock.patch.object(server.zipfile, "ZipFile") as zip_reader:
+                with self.assertRaises(server.RuntimeOperationError) as raised:
+                    server.validate_office_upload(
+                        source.fileno(), "word/document.xml"
+                    )
+
+        zip_reader.assert_not_called()
+        self.assertEqual(raised.exception.code, "unsupported_file_type")
+        self.assertEqual(raised.exception.status, 415)
+
+    def test_upload_uses_conditional_atomic_overwrite(self):
+        original = self.workspace / "README.md"
+        original_bytes = original.read_bytes()
+
+        with self.assertRaises(server.RuntimeOperationError) as conflict:
+            self.upload("README.md", b"replacement")
+        self.assertEqual(conflict.exception.code, "file_already_exists")
+        self.assertEqual(original.read_bytes(), original_bytes)
+
+        etag = server.workspace_file_etag(os.stat(original, follow_symlinks=False))
+        with self.assertRaises(server.RuntimeOperationError) as mismatch:
+            self.upload("README.md", b"replacement", if_match="0" * 64)
+        self.assertEqual(mismatch.exception.code, "etag_mismatch")
+        self.assertEqual(original.read_bytes(), original_bytes)
+
+        result = self.upload(
+            "README.md", b"replacement", if_match=f'"{etag}"'
+        )
+        self.assertTrue(result["overwritten"])
+        self.assertEqual(original.read_bytes(), b"replacement")
+        self.assertNotEqual(result["etag"], etag)
+
+    def test_upload_enforces_actual_length_size_and_workspace_quota(self):
+        with self.assertRaises(server.RuntimeOperationError) as incomplete:
+            server.upload_workspace_file(
+                "session-1",
+                "src/incomplete.txt",
+                io.BytesIO(b"short"),
+                10,
+            )
+        self.assertEqual(incomplete.exception.code, "upload_incomplete")
+        self.assertFalse((self.workspace / "src" / "incomplete.txt").exists())
+
+        with mock.patch.object(server, "MAX_UPLOAD_FILE_BYTES", 4):
+            with self.assertRaises(server.RuntimeOperationError) as oversized:
+                self.upload("src/oversized.txt", b"12345")
+        self.assertEqual(oversized.exception.code, "file_too_large")
+
+        workspace_bytes = server.workspace_regular_file_bytes(self.workspace)
+        with self.assertRaises(server.RuntimeOperationError) as quota:
+            self.upload(
+                "src/quota.txt",
+                b"123",
+                workspace_max_bytes=workspace_bytes + 2,
+            )
+        self.assertEqual(quota.exception.code, "workspace_size_exceeded")
+        self.assertFalse((self.workspace / "src" / "quota.txt").exists())
+        self.assertEqual(
+            list(self.workspace.rglob(f"{server.UPLOAD_TEMP_PREFIX}*")), []
+        )
+
+    def test_upload_quota_counts_only_persistable_workspace_files(self):
+        expected = (self.workspace / "README.md").stat().st_size
+        expected += (self.workspace / "src" / "app.ts").stat().st_size
+        # The pre-existing archive contract persists .git; upload quota uses
+        # that same contract while excluding regenerable dependencies/caches.
+        expected += (self.workspace / ".git" / "config").stat().st_size
+        self.assertEqual(
+            server.workspace_regular_file_bytes(self.workspace), expected
+        )
+
+        (self.workspace / ".next" / "cache").mkdir(parents=True)
+        (self.workspace / ".next" / "cache" / "large.bin").write_bytes(
+            b"x" * 10_000
+        )
+        (self.workspace / f"{server.UPLOAD_TEMP_PREFIX}partial.tmp").write_bytes(
+            b"x" * 10_000
+        )
+        outside = Path(self.temp_dir.name) / "outside-quota.bin"
+        outside.write_bytes(b"x" * 10_000)
+        (self.workspace / "quota-link").symlink_to(outside)
+
+        self.assertEqual(
+            server.workspace_regular_file_bytes(self.workspace), expected
+        )
+        self.assertTrue(
+            server.archive_path_is_excluded(
+                server.PurePosixPath(f"{server.UPLOAD_TEMP_PREFIX}partial.tmp")
+            )
+        )
+
+    def test_upload_rejects_unsafe_parent_and_target_paths(self):
+        outside = Path(self.temp_dir.name) / "outside"
+        outside.mkdir()
+        (self.workspace / "linked").symlink_to(outside, target_is_directory=True)
+        for path in [
+            "../escape.txt",
+            "/absolute.txt",
+            "C:/escape.txt",
+            "C:escape.txt",
+            ".env",
+            "node_modules/new.txt",
+            "src\\escape.txt",
+            "linked/escape.txt",
+        ]:
+            with self.subTest(path=path):
+                with self.assertRaises(server.RuntimeOperationError):
+                    self.upload(path, b"safe text")
+        self.assertFalse((outside / "escape.txt").exists())
+
+    def test_download_all_builds_safe_zip_and_excludes_platform_files(self):
+        (self.workspace / ".env").write_text("USER_SETTING=yes\n")
+        (self.workspace / "dist").mkdir()
+        (self.workspace / "dist" / "artifact.bin").write_bytes(b"\x00\xff")
+        (self.workspace / "empty").mkdir()
+        (self.workspace / ".next" / "cache").mkdir(parents=True)
+        (self.workspace / ".next" / "cache" / "cached.bin").write_bytes(b"x")
+        (self.workspace / ".output" / "cache").mkdir(parents=True)
+        (self.workspace / ".output" / "cache" / "cached.bin").write_bytes(b"x")
+        (self.workspace / f"{server.UPLOAD_TEMP_PREFIX}orphan.tmp").write_bytes(
+            b"partial"
+        )
+        outside = Path(self.temp_dir.name) / "outside.txt"
+        outside.write_text("outside")
+        (self.workspace / "outside-link").symlink_to(outside)
+        os.mkfifo(self.workspace / "pipe")
+        (self.workspace / "..\\escape.txt").write_text("unsafe name")
+        (self.workspace / "C:").mkdir()
+        (self.workspace / "C:" / "drive.txt").write_text("unsafe drive")
+        (self.workspace / "safe.txt:stream").write_text("unsafe stream")
+
+        archive_file, metadata = server.make_workspace_zip("session-1")
+        try:
+            with zipfile.ZipFile(archive_file) as archive:
+                names = set(archive.namelist())
+                self.assertIn("README.md", names)
+                self.assertIn("src/app.ts", names)
+                self.assertIn("dist/artifact.bin", names)
+                self.assertIn(".env", names)
+                self.assertIn("empty/", names)
+                self.assertEqual(archive.read("dist/artifact.bin"), b"\x00\xff")
+                self.assertFalse(any(name.startswith(".git/") for name in names))
+                self.assertFalse(any(name.startswith("node_modules/") for name in names))
+                self.assertFalse(any("/cache/" in f"/{name}" for name in names))
+                self.assertNotIn("outside-link", names)
+                self.assertNotIn("pipe", names)
+                self.assertNotIn("..\\escape.txt", names)
+                self.assertNotIn("C:/drive.txt", names)
+                self.assertNotIn("safe.txt:stream", names)
+                self.assertTrue(all("\\" not in name for name in names))
+                self.assertTrue(all(":" not in name for name in names))
+                self.assertFalse(
+                    any(part == ".." for name in names for part in Path(name).parts)
+                )
+                self.assertTrue(all(not name.startswith("/") for name in names))
+        finally:
+            archive_file.close()
+
+        self.assertGreaterEqual(metadata["fileCount"], 4)
+        self.assertGreaterEqual(metadata["skippedCount"], 6)
+        self.assertGreater(metadata["archiveBytes"], 0)
+
+    def test_download_all_enforces_file_source_and_archive_limits(self):
+        with self.assertRaises(server.RuntimeOperationError) as files:
+            server.make_workspace_zip("session-1", max_files=1)
+        self.assertEqual(files.exception.code, "export_file_limit_exceeded")
+
+        with self.assertRaises(server.RuntimeOperationError) as source_size:
+            server.make_workspace_zip("session-1", max_uncompressed_bytes=1)
+        self.assertEqual(source_size.exception.code, "export_size_exceeded")
+
+        with self.assertRaises(server.RuntimeOperationError) as archive_size:
+            server.make_workspace_zip("session-1", max_archive_bytes=1)
+        self.assertEqual(
+            archive_size.exception.code, "export_archive_size_exceeded"
+        )
+
+        empty_root = Path(self.temp_dir.name) / "empty-workspace"
+        (empty_root / "one").mkdir(parents=True)
+        (empty_root / "two").mkdir()
+        with self.assertRaises(server.RuntimeOperationError) as entries:
+            server.scan_workspace_export(empty_root, max_files=1)
+        self.assertEqual(entries.exception.code, "export_file_limit_exceeded")
+
+    def test_download_all_response_is_attachment_and_never_cached(self):
+        handler = RecordingHandler()
+
+        server.serve_workspace_zip(handler, "session-1")
+
+        self.assertEqual(handler.status, 200)
+        self.assertEqual(handler.headers["content-type"], "application/zip")
+        self.assertIn("attachment", handler.headers["content-disposition"])
+        self.assertIn("filename*=UTF-8''", handler.headers["content-disposition"])
+        self.assertEqual(handler.headers["cache-control"], "private, no-store")
+        self.assertEqual(handler.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(
+            int(handler.headers["content-length"]), len(handler.wfile.getvalue())
+        )
+        with zipfile.ZipFile(io.BytesIO(handler.wfile.getvalue())) as archive:
+            self.assertEqual(archive.read("README.md"), b"# Demo\n")
+
+    def test_file_transfers_are_single_flight_per_session(self):
+        with server.workspace_file_transfer("session-1", "test.lock"):
+            with self.assertRaises(server.RuntimeOperationError) as upload:
+                self.upload("src/busy.txt", b"busy", if_none_match="*")
+            self.assertEqual(upload.exception.code, "workspace_transfer_busy")
+            self.assertEqual(upload.exception.status, 429)
+
+            with self.assertRaises(server.RuntimeOperationError) as download:
+                server.serve_workspace_zip(RecordingHandler(), "session-1")
+            self.assertEqual(download.exception.code, "workspace_transfer_busy")
+            self.assertEqual(download.exception.status, 429)
+
+        result = self.upload("src/available.txt", b"available", if_none_match="*")
+        self.assertEqual(result["path"], "src/available.txt")
 
 
 if __name__ == "__main__":

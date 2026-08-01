@@ -1817,6 +1817,22 @@ function CodeWorkspacePage() {
                         inactive: m['code.files.inactive'](),
                         truncated: m['code.files.truncated'](),
                         selected: m['code.files.selected'](),
+                        upload: m['code.files.upload'](),
+                        uploadHint: m['code.files.upload_hint'](),
+                        dropFiles: m['code.files.drop_files'](),
+                        uploadPending: m['code.files.upload_pending'](),
+                        uploading: m['code.files.uploading'](),
+                        uploadSuccess: m['code.files.upload_success'](),
+                        uploadFailed: m['code.files.upload_failed'](),
+                        uploadTooLarge: m['code.files.upload_too_large'](),
+                        uploadWorkspaceFull:
+                          m['code.files.upload_workspace_full'](),
+                        uploadUnsupported: m['code.files.upload_unsupported'](),
+                        uploadConflict: m['code.files.upload_conflict'](),
+                        uploadQueueLimit: m['code.files.upload_queue_limit'](),
+                        downloadAll: m['code.files.download_all'](),
+                        downloadPreparing: m['code.files.download_preparing'](),
+                        downloadFailed: m['code.files.download_failed'](),
                       }}
                     />
                   </div>

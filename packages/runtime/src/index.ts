@@ -2314,13 +2314,18 @@ export default {
     }
 
     const filesMatch = url.pathname.match(
-      /^\/files\/([^/]+)\/([^/]+)(?:\/(status|content))?$/
+      /^\/files\/([^/]+)\/([^/]+)(?:\/(status|content|upload|download-all))?$/
     );
     if (filesMatch) {
       if (!runtimeSecretAuthorized(request, env)) {
         return json({ ok: false, error: 'unauthorized' }, { status: 401 });
       }
-      if (request.method !== 'GET') {
+      const operation = filesMatch[3] || '';
+      const isUpload = operation === 'upload';
+      if (
+        (isUpload && request.method !== 'PUT') ||
+        (!isUpload && request.method !== 'GET')
+      ) {
         return json(
           { ok: false, error: 'method_not_allowed' },
           { status: 405 }
@@ -2329,16 +2334,28 @@ export default {
 
       const userId = decodeURIComponent(filesMatch[1]);
       const sessionId = decodeURIComponent(filesMatch[2]);
-      const operation = filesMatch[3] || '';
       const target = new URL(request.url);
       target.pathname = `/files/${encodeURIComponent(sessionId)}${operation ? `/${operation}` : ''}`;
       const headers = new Headers();
       headers.set('x-codeagent-user', userId);
       headers.set('x-codeagent-session', sessionId);
+      if (isUpload) {
+        for (const name of [
+          'content-type',
+          'content-length',
+          'if-match',
+          'if-none-match',
+          'x-workspace-max-bytes',
+        ]) {
+          const value = request.headers.get(name);
+          if (value !== null) headers.set(name, value);
+        }
+      }
       return container(env, userId).fetch(
         new Request(target, {
-          method: 'GET',
+          method: request.method,
           headers,
+          body: isUpload ? request.body : undefined,
         })
       );
     }

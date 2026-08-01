@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import errno
 import heapq
 import hashlib
@@ -26,6 +27,8 @@ import termios
 import threading
 import uuid
 import fcntl
+import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path, PurePosixPath
@@ -68,6 +71,65 @@ ARCHIVE_EXCLUDED_PATHS = {
 }
 ARCHIVE_IO_CHUNK_BYTES = 1024 * 1024
 MAX_SAFE_INTEGER = 9007199254740991
+MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024
+MAX_OFFICE_ZIP_ENTRIES = 10_000
+MAX_OFFICE_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024
+MAX_ZIP_EOCD_SEARCH_BYTES = 22 + 65_535
+DEFAULT_WORKSPACE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+MAX_EXPORT_FILE_COUNT = 20_000
+MAX_EXPORT_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_EXPORT_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+FILE_TRANSFER_IO_CHUNK_BYTES = 1024 * 1024
+UPLOAD_TEMP_PREFIX = ".codeagent-upload-"
+EXPORT_EXCLUDED_DIR_NAMES = ARCHIVE_EXCLUDED_DIR_NAMES | {
+    ".codeagent",
+    ".git",
+}
+EXPORT_EXCLUDED_PATHS = ARCHIVE_EXCLUDED_PATHS | {
+    (".output", "cache"),
+}
+UPLOAD_IMAGE_TYPES = {
+    ".gif": ("image", "image/gif"),
+    ".jpeg": ("image", "image/jpeg"),
+    ".jpg": ("image", "image/jpeg"),
+    ".png": ("image", "image/png"),
+    ".webp": ("image", "image/webp"),
+}
+UPLOAD_DOCUMENT_TYPES = {
+    ".docx": ("document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "word/document.xml"),
+    ".xlsx": ("document", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xl/workbook.xml"),
+    ".pptx": ("document", "application/vnd.openxmlformats-officedocument.presentationml.presentation", "ppt/presentation.xml"),
+}
+UPLOAD_REJECTED_SUFFIXES = {
+    ".7z",
+    ".apk",
+    ".app",
+    ".bat",
+    ".bz2",
+    ".cmd",
+    ".com",
+    ".dll",
+    ".dmg",
+    ".doc",
+    ".docm",
+    ".exe",
+    ".gz",
+    ".iso",
+    ".jar",
+    ".msi",
+    ".ppt",
+    ".pptm",
+    ".rar",
+    ".tar",
+    ".tgz",
+    ".war",
+    ".xls",
+    ".xlsm",
+    ".xz",
+    ".zip",
+}
+WORKSPACE_FILE_LOCKS: dict[str, threading.Lock] = {}
+WORKSPACE_FILE_LOCKS_GUARD = threading.Lock()
 
 
 class RuntimeOperationError(Exception):
@@ -217,7 +279,10 @@ def workspace_file_parts(requested_path: str) -> list[str]:
         raise WorkspacePreviewError("invalid_path", 400)
 
     parts = raw.split("/")
-    if any(not part or part in {".", ".."} for part in parts):
+    if any(
+        not part or part in {".", ".."} or "\\" in part or ":" in part
+        for part in parts
+    ):
         raise WorkspacePreviewError("invalid_path", 400)
     for part in parts:
         lowered = part.lower()
@@ -500,6 +565,982 @@ def serve_workspace_file_raw(handler, session_id: str, requested_path: str):
         close_workspace_file(opened)
 
 
+def workspace_file_lock(session_id: str) -> threading.Lock:
+    key = safe_name(session_id)
+    with WORKSPACE_FILE_LOCKS_GUARD:
+        lock = WORKSPACE_FILE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            WORKSPACE_FILE_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def workspace_file_transfer(session_id: str, stage: str):
+    lock = workspace_file_lock(session_id)
+    if not lock.acquire(blocking=False):
+        raise RuntimeOperationError(
+            "workspace_transfer_busy",
+            stage,
+            "Another workspace file transfer is already in progress",
+            429,
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def upload_error(
+    code: str,
+    status: int,
+    message: str,
+    details=None,
+    stage: str = "upload",
+):
+    return RuntimeOperationError(code, stage, message, status, details)
+
+
+def upload_path_parts(requested_path: str) -> list[str]:
+    try:
+        return workspace_file_parts(requested_path)
+    except WorkspacePreviewError as error:
+        raise upload_error(
+            error.code,
+            error.status,
+            "Upload path is not available",
+            {"path": requested_path},
+            "upload.path",
+        ) from None
+
+
+def open_workspace_parent(session_id: str, requested_path: str):
+    parts = upload_path_parts(requested_path)
+    root = session_path(session_id)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    opened: list[int] = []
+    try:
+        current_fd = os.open(root, flags)
+        opened.append(current_fd)
+        for part in parts[:-1]:
+            current_fd = os.open(part, flags, dir_fd=current_fd)
+            opened.append(current_fd)
+        return current_fd, parts[-1], "/".join(parts), opened
+    except OSError as error:
+        close_workspace_file(opened)
+        if error.errno in {
+            errno.ELOOP,
+            errno.ENOENT,
+            errno.ENOTDIR,
+            errno.EACCES,
+            errno.EPERM,
+        }:
+            raise upload_error(
+                "file_not_available",
+                404,
+                "Upload directory is not available",
+                {"path": requested_path},
+                "upload.path",
+            ) from None
+        raise upload_error(
+            "upload_open_failed",
+            500,
+            "Failed to open the upload directory",
+            {"path": requested_path, "reason": str(error)},
+            "upload.path",
+        ) from error
+
+
+def parse_upload_etag(value: str, header_name: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("W/") or "," in raw:
+        raise upload_error(
+            "invalid_upload_precondition",
+            400,
+            f"{header_name} must contain one strong ETag",
+            stage="upload.precondition",
+        )
+    if raw.startswith('"') or raw.endswith('"'):
+        if len(raw) < 2 or not (raw.startswith('"') and raw.endswith('"')):
+            raise upload_error(
+                "invalid_upload_precondition",
+                400,
+                f"{header_name} contains an invalid ETag",
+                stage="upload.precondition",
+            )
+        raw = raw[1:-1]
+    if not re.fullmatch(r"[a-fA-F0-9]{64}", raw):
+        raise upload_error(
+            "invalid_upload_precondition",
+            400,
+            f"{header_name} contains an invalid ETag",
+            stage="upload.precondition",
+        )
+    return raw.lower()
+
+
+def upload_target_stat(parent_fd: int, name: str):
+    try:
+        result = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise upload_error(
+            "file_not_available",
+            404,
+            "Upload target is not available",
+            {"reason": str(error)},
+            "upload.precondition",
+        ) from error
+    if not stat.S_ISREG(result.st_mode):
+        raise upload_error(
+            "file_not_available",
+            404,
+            "Upload target is not a regular file",
+            stage="upload.precondition",
+        )
+    return result
+
+
+def check_upload_precondition(
+    existing_stat,
+    if_match: str,
+    if_none_match: str,
+):
+    if if_match and if_none_match:
+        raise upload_error(
+            "invalid_upload_precondition",
+            400,
+            "If-Match and If-None-Match cannot be combined",
+            stage="upload.precondition",
+        )
+    if if_none_match and if_none_match.strip() != "*":
+        raise upload_error(
+            "invalid_upload_precondition",
+            400,
+            "If-None-Match only supports * for uploads",
+            stage="upload.precondition",
+        )
+    expected = parse_upload_etag(if_match, "If-Match")
+    if expected:
+        if existing_stat is None or workspace_file_etag(existing_stat) != expected:
+            raise upload_error(
+                "etag_mismatch",
+                412,
+                "The upload target has changed",
+                stage="upload.precondition",
+            )
+        return True
+    if existing_stat is not None:
+        raise upload_error(
+            "file_already_exists",
+            409,
+            "The upload target already exists",
+            stage="upload.precondition",
+        )
+    return False
+
+
+def parse_workspace_max_bytes(raw) -> int:
+    if raw is None or raw == "":
+        return DEFAULT_WORKSPACE_MAX_BYTES
+    value = str(raw).strip()
+    if not value.isdigit():
+        raise upload_error(
+            "invalid_workspace_max_bytes",
+            400,
+            "x-workspace-max-bytes must be a non-negative safe integer",
+            stage="upload.quota",
+        )
+    parsed = int(value)
+    if parsed > MAX_SAFE_INTEGER:
+        raise upload_error(
+            "invalid_workspace_max_bytes",
+            400,
+            "x-workspace-max-bytes must be a non-negative safe integer",
+            stage="upload.quota",
+        )
+    return parsed
+
+
+def workspace_regular_file_bytes(root: Path) -> int:
+    total = 0
+
+    def handle_walk_error(error):
+        raise upload_error(
+            "workspace_scan_failed",
+            500,
+            "Failed to calculate workspace usage",
+            {"reason": str(error)},
+            "upload.quota",
+        )
+
+    if not root.exists():
+        return 0
+    for current, dir_names, file_names in os.walk(
+        root, followlinks=False, onerror=handle_walk_error
+    ):
+        current_path = Path(current)
+        kept_dirs = []
+        for name in dir_names:
+            path = current_path / name
+            relative = PurePosixPath(path.relative_to(root).as_posix())
+            try:
+                if not path.is_symlink() and not archive_path_is_excluded(
+                    relative
+                ):
+                    kept_dirs.append(name)
+            except OSError:
+                continue
+        dir_names[:] = kept_dirs
+        for name in file_names:
+            path = current_path / name
+            relative = PurePosixPath(path.relative_to(root).as_posix())
+            if name.startswith(UPLOAD_TEMP_PREFIX) or archive_path_is_excluded(
+                relative
+            ):
+                continue
+            try:
+                result = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise upload_error(
+                    "workspace_scan_failed",
+                    500,
+                    "Failed to calculate workspace usage",
+                    {"reason": str(error)},
+                    "upload.quota",
+                ) from error
+            if stat.S_ISREG(result.st_mode):
+                total += result.st_size
+                if total > MAX_SAFE_INTEGER:
+                    raise upload_error(
+                        "workspace_size_exceeded",
+                        413,
+                        "Workspace size exceeds the supported limit",
+                        {"actualBytes": total},
+                        "upload.quota",
+                    )
+    return total
+
+
+def read_file_range(file_fd: int, offset: int, length: int) -> bytes:
+    chunks = []
+    bytes_read = 0
+    while bytes_read < length:
+        chunk = os.pread(
+            file_fd,
+            length - bytes_read,
+            offset + bytes_read,
+        )
+        if not chunk:
+            break
+        chunks.append(chunk)
+        bytes_read += len(chunk)
+    result = b"".join(chunks)
+    if len(result) != length:
+        raise ValueError("incomplete Office ZIP data")
+    return result
+
+
+def validate_office_zip_directory(file_fd: int):
+    file_size = os.fstat(file_fd).st_size
+    tail_size = min(file_size, MAX_ZIP_EOCD_SEARCH_BYTES)
+    tail_offset = file_size - tail_size
+    tail = read_file_range(file_fd, tail_offset, tail_size)
+    if len(tail) != tail_size:
+        raise ValueError("incomplete Office ZIP directory")
+
+    eocd_index = tail.rfind(b"PK\x05\x06")
+    if eocd_index < 0 or len(tail) - eocd_index < 22:
+        raise ValueError("missing Office ZIP end record")
+    (
+        signature,
+        disk_number,
+        directory_disk,
+        disk_entries,
+        total_entries,
+        directory_size,
+        directory_offset,
+        comment_length,
+    ) = struct.unpack_from("<4s4H2LH", tail, eocd_index)
+    eocd_offset = tail_offset + eocd_index
+    if (
+        signature != b"PK\x05\x06"
+        or disk_number != 0
+        or directory_disk != 0
+        or disk_entries != total_entries
+        or eocd_offset + 22 + comment_length != file_size
+        or directory_offset + directory_size != eocd_offset
+    ):
+        raise ValueError("unsupported Office ZIP directory")
+    if (
+        total_entries == 0xFFFF
+        or directory_size == 0xFFFFFFFF
+        or directory_offset == 0xFFFFFFFF
+    ):
+        raise ValueError("ZIP64 Office documents are not supported")
+    if total_entries > MAX_OFFICE_ZIP_ENTRIES:
+        raise ValueError("Office document contains too many entries")
+    if directory_size > MAX_OFFICE_CENTRAL_DIRECTORY_BYTES:
+        raise ValueError("Office document directory is too large")
+
+    cursor = directory_offset
+    actual_entries = 0
+    while cursor < eocd_offset:
+        if eocd_offset - cursor < 46:
+            raise ValueError("truncated Office ZIP directory entry")
+        header = read_file_range(file_fd, cursor, 46)
+        signature, name_length, extra_length, entry_comment_length = (
+            struct.unpack_from("<4s24x3H", header)
+        )
+        if signature != b"PK\x01\x02":
+            raise ValueError("invalid Office ZIP directory entry")
+        entry_size = 46 + name_length + extra_length + entry_comment_length
+        if cursor + entry_size > eocd_offset:
+            raise ValueError("invalid Office ZIP directory entry size")
+        actual_entries += 1
+        if actual_entries > MAX_OFFICE_ZIP_ENTRIES:
+            raise ValueError("Office document contains too many entries")
+        cursor += entry_size
+    if cursor != eocd_offset or actual_entries != total_entries:
+        raise ValueError("Office ZIP entry count does not match its directory")
+
+
+def validate_office_upload(file_fd: int, required_entry: str):
+    try:
+        validate_office_zip_directory(file_fd)
+        with os.fdopen(os.dup(file_fd), "rb") as source:
+            with zipfile.ZipFile(source, mode="r") as document:
+                entries = document.infolist()
+                names = {entry.filename for entry in entries}
+                lowered_names = {name.lower() for name in names}
+                if (
+                    "[Content_Types].xml" not in names
+                    or required_entry not in names
+                    or len(entries) > MAX_OFFICE_ZIP_ENTRIES
+                    or sum(entry.file_size for entry in entries)
+                    > 200 * 1024 * 1024
+                    or any(name.endswith("vbaproject.bin") for name in lowered_names)
+                    or any(entry.flag_bits & 0x1 for entry in entries)
+                ):
+                    raise ValueError("unsupported Office document structure")
+                for name in names:
+                    pure = PurePosixPath(name)
+                    if pure.is_absolute() or ".." in pure.parts:
+                        raise ValueError("unsafe Office document entry")
+    except (OSError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
+        raise upload_error(
+            "unsupported_file_type",
+            415,
+            "The uploaded file is not a supported Office document",
+            {"reason": str(error)},
+            "upload.validation",
+        ) from None
+
+
+def validate_utf8_upload(file_fd: int):
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    try:
+        while True:
+            chunk = os.read(file_fd, FILE_TRANSFER_IO_CHUNK_BYTES)
+            if not chunk:
+                break
+            if b"\x00" in chunk:
+                raise ValueError("text files cannot contain NUL bytes")
+            decoder.decode(chunk, final=False)
+        decoder.decode(b"", final=True)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise upload_error(
+            "unsupported_file_type",
+            415,
+            "The uploaded file is not valid UTF-8 plain text",
+            {"reason": str(error)},
+            "upload.validation",
+        ) from None
+    finally:
+        os.lseek(file_fd, 0, os.SEEK_SET)
+
+
+def validate_upload_file(file_fd: int, filename: str):
+    suffix = Path(filename).suffix.lower()
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    sample = os.read(file_fd, 8192)
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    if suffix in UPLOAD_IMAGE_TYPES:
+        if not valid_preview_signature("image", suffix, sample):
+            raise upload_error(
+                "unsupported_file_type",
+                415,
+                "The uploaded file does not match its image extension",
+                stage="upload.validation",
+            )
+        return UPLOAD_IMAGE_TYPES[suffix]
+    if suffix == ".pdf":
+        if not valid_preview_signature("pdf", suffix, sample):
+            raise upload_error(
+                "unsupported_file_type",
+                415,
+                "The uploaded file is not a PDF document",
+                stage="upload.validation",
+            )
+        return "document", "application/pdf"
+    if suffix in UPLOAD_DOCUMENT_TYPES:
+        kind, content_type, required_entry = UPLOAD_DOCUMENT_TYPES[suffix]
+        validate_office_upload(file_fd, required_entry)
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        return kind, content_type
+    if suffix in UPLOAD_REJECTED_SUFFIXES:
+        raise upload_error(
+            "unsupported_file_type",
+            415,
+            "The uploaded file type is not supported",
+            stage="upload.validation",
+        )
+    validate_utf8_upload(file_fd)
+    return "text", "text/plain; charset=utf-8"
+
+
+def upload_workspace_file(
+    session_id: str,
+    requested_path: str,
+    source,
+    content_length: int,
+    *,
+    if_match: str = "",
+    if_none_match: str = "",
+    workspace_max_bytes=DEFAULT_WORKSPACE_MAX_BYTES,
+):
+    if not isinstance(content_length, int) or content_length < 0:
+        raise upload_error(
+            "content_length_required",
+            411,
+            "A valid Content-Length header is required",
+            stage="upload.request",
+        )
+    if content_length > MAX_UPLOAD_FILE_BYTES:
+        raise upload_error(
+            "file_too_large",
+            413,
+            "Uploaded files cannot exceed 50 MiB",
+            {"maxBytes": MAX_UPLOAD_FILE_BYTES, "actualBytes": content_length},
+            "upload.request",
+        )
+    max_bytes = parse_workspace_max_bytes(workspace_max_bytes)
+    with workspace_file_transfer(session_id, "upload.lock"):
+        parent_fd, target_name, relative_path, opened = open_workspace_parent(
+            session_id, requested_path
+        )
+        temp_name = f"{UPLOAD_TEMP_PREFIX}{uuid.uuid4().hex}.tmp"
+        temp_fd = -1
+        committed = False
+        try:
+            existing = upload_target_stat(parent_fd, target_name)
+            overwritten = check_upload_precondition(
+                existing, if_match, if_none_match
+            )
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            temp_fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+            bytes_read = 0
+            while bytes_read < content_length:
+                chunk = source.read(
+                    min(FILE_TRANSFER_IO_CHUNK_BYTES, content_length - bytes_read)
+                )
+                if not chunk:
+                    raise upload_error(
+                        "upload_incomplete",
+                        400,
+                        "The upload ended before Content-Length bytes arrived",
+                        {"expectedBytes": content_length, "actualBytes": bytes_read},
+                        "upload.request",
+                    )
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(temp_fd, view)
+                    if written <= 0:
+                        raise OSError("failed to write upload data")
+                    view = view[written:]
+                bytes_read += len(chunk)
+                if bytes_read > MAX_UPLOAD_FILE_BYTES:
+                    raise upload_error(
+                        "file_too_large",
+                        413,
+                        "Uploaded files cannot exceed 50 MiB",
+                        {"maxBytes": MAX_UPLOAD_FILE_BYTES, "actualBytes": bytes_read},
+                        "upload.request",
+                    )
+
+            kind, content_type = validate_upload_file(temp_fd, target_name)
+            os.fchmod(temp_fd, 0o644)
+            if os.geteuid() == 0:
+                user = runtime_user_info()
+                os.fchown(temp_fd, user.pw_uid, user.pw_gid)
+            os.fsync(temp_fd)
+
+            current = upload_target_stat(parent_fd, target_name)
+            overwritten = check_upload_precondition(
+                current, if_match, if_none_match
+            )
+            current_bytes = current.st_size if current is not None else 0
+            workspace_bytes = workspace_regular_file_bytes(
+                session_path(session_id)
+            )
+            projected_bytes = workspace_bytes - current_bytes + bytes_read
+            if projected_bytes > max_bytes:
+                raise upload_error(
+                    "workspace_size_exceeded",
+                    413,
+                    "The upload would exceed the workspace size limit",
+                    {
+                        "maxBytes": max_bytes,
+                        "actualBytes": projected_bytes,
+                        "workspaceBytes": workspace_bytes,
+                    },
+                    "upload.quota",
+                )
+
+            if overwritten:
+                os.replace(
+                    temp_name,
+                    target_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                committed = True
+            else:
+                try:
+                    # Linking the completed temporary inode into its final name
+                    # is an atomic create-if-absent operation. Unlike replace(),
+                    # it cannot clobber a file created after our final stat.
+                    os.link(
+                        temp_name,
+                        target_name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    raise upload_error(
+                        "file_already_exists",
+                        409,
+                        "The upload target already exists",
+                        stage="upload.precondition",
+                    ) from None
+                committed = True
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except OSError:
+                    # The final hard link is already durable. Orphaned upload
+                    # names are reserved, excluded from quota/export, and can
+                    # be safely removed by routine workspace cleanup.
+                    pass
+            os.fsync(parent_fd)
+            result_stat = os.fstat(temp_fd)
+            etag = workspace_file_etag(result_stat)
+            return {
+                "ok": True,
+                "path": relative_path,
+                "name": target_name,
+                "size": result_stat.st_size,
+                "mtime": iso_mtime(result_stat),
+                "etag": etag,
+                "mimeType": content_type,
+                "kind": kind,
+                "overwritten": overwritten,
+                "workspaceBytes": projected_bytes,
+                "workspaceMaxBytes": max_bytes,
+            }
+        except RuntimeOperationError:
+            raise
+        except OSError as error:
+            raise upload_error(
+                "upload_write_failed",
+                500,
+                "Failed to store the uploaded file",
+                {"path": relative_path, "reason": str(error)},
+                "upload.write",
+            ) from error
+        finally:
+            if temp_fd >= 0:
+                try:
+                    os.close(temp_fd)
+                except OSError:
+                    pass
+            if not committed:
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            close_workspace_file(opened)
+
+
+def export_path_is_excluded(relative: PurePosixPath) -> bool:
+    parts = relative.parts
+    if any(part in EXPORT_EXCLUDED_DIR_NAMES for part in parts):
+        return True
+    if any(part.startswith(UPLOAD_TEMP_PREFIX) for part in parts):
+        return True
+    return any(
+        parts[: len(prefix)] == prefix for prefix in EXPORT_EXCLUDED_PATHS
+    )
+
+
+def export_path_is_safe(relative: PurePosixPath) -> bool:
+    parts = relative.parts
+    return bool(parts) and not relative.is_absolute() and not (
+        any(
+            part in {"", ".", ".."} or "\\" in part or ":" in part
+            for part in parts
+        )
+    )
+
+
+def scan_workspace_export(
+    root: Path,
+    max_files: int = MAX_EXPORT_FILE_COUNT,
+    max_uncompressed_bytes: int = MAX_EXPORT_UNCOMPRESSED_BYTES,
+):
+    if not root.exists():
+        raise RuntimeOperationError(
+            "workspace_not_found",
+            "export.scan",
+            "Workspace not found",
+            404,
+        )
+    entries = []
+    empty_directories = []
+    skipped_count = 0
+    total_bytes = 0
+
+    def handle_walk_error(error):
+        raise RuntimeOperationError(
+            "export_scan_failed",
+            "export.scan",
+            f"Failed to scan workspace: {error}",
+            500,
+        )
+
+    for current, dir_names, file_names in os.walk(
+        root, followlinks=False, onerror=handle_walk_error
+    ):
+        current_path = Path(current)
+        kept_dirs = []
+        for name in sorted(dir_names):
+            path = current_path / name
+            relative = PurePosixPath(path.relative_to(root).as_posix())
+            try:
+                is_link = path.is_symlink()
+            except OSError:
+                is_link = True
+            if (
+                is_link
+                or not export_path_is_safe(relative)
+                or export_path_is_excluded(relative)
+            ):
+                skipped_count += 1
+            else:
+                kept_dirs.append(name)
+        dir_names[:] = kept_dirs
+
+        current_file_count = 0
+        for name in sorted(file_names):
+            path = current_path / name
+            relative = PurePosixPath(path.relative_to(root).as_posix())
+            if not export_path_is_safe(relative) or export_path_is_excluded(
+                relative
+            ):
+                skipped_count += 1
+                continue
+            try:
+                result = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                skipped_count += 1
+                continue
+            except OSError as error:
+                raise RuntimeOperationError(
+                    "export_scan_failed",
+                    "export.scan",
+                    "Failed to inspect a workspace file",
+                    500,
+                    {"path": relative.as_posix(), "reason": str(error)},
+                ) from error
+            if not stat.S_ISREG(result.st_mode):
+                skipped_count += 1
+                continue
+            current_file_count += 1
+            total_bytes += result.st_size
+            if len(entries) + len(empty_directories) + 1 > max_files:
+                raise RuntimeOperationError(
+                    "export_file_limit_exceeded",
+                    "export.scan",
+                    "Workspace export contains too many entries",
+                    413,
+                    {
+                        "maxFiles": max_files,
+                        "actualFiles": len(entries) + len(empty_directories) + 1,
+                    },
+                )
+            if total_bytes > max_uncompressed_bytes:
+                raise RuntimeOperationError(
+                    "export_size_exceeded",
+                    "export.scan",
+                    "Workspace export is too large",
+                    413,
+                    {
+                        "maxBytes": max_uncompressed_bytes,
+                        "actualBytes": total_bytes,
+                    },
+                )
+            entries.append(
+                {
+                    "path": relative.as_posix(),
+                    "parts": relative.parts,
+                    "size": result.st_size,
+                    "mode": result.st_mode & 0o777,
+                    "mtime": result.st_mtime,
+                    "mtime_ns": result.st_mtime_ns,
+                    "inode": result.st_ino,
+                }
+            )
+        if current_path != root and not kept_dirs and current_file_count == 0:
+            relative = PurePosixPath(current_path.relative_to(root).as_posix())
+            if export_path_is_safe(relative) and not export_path_is_excluded(
+                relative
+            ):
+                if len(entries) + len(empty_directories) + 1 > max_files:
+                    raise RuntimeOperationError(
+                        "export_file_limit_exceeded",
+                        "export.scan",
+                        "Workspace export contains too many entries",
+                        413,
+                        {
+                            "maxFiles": max_files,
+                            "actualFiles": len(entries)
+                            + len(empty_directories)
+                            + 1,
+                        },
+                    )
+                empty_directories.append(f"{relative.as_posix().rstrip('/')}/")
+
+    entries.sort(key=lambda entry: entry["path"])
+    empty_directories.sort()
+    return entries, empty_directories, skipped_count, total_bytes
+
+
+def open_export_file(root_fd: int, parts):
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    file_flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_flags |= getattr(os, "O_NONBLOCK", 0)
+    opened: list[int] = []
+    try:
+        current_fd = os.dup(root_fd)
+        opened.append(current_fd)
+        for part in parts[:-1]:
+            current_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            opened.append(current_fd)
+        file_fd = os.open(parts[-1], file_flags, dir_fd=current_fd)
+        opened.append(file_fd)
+        return file_fd, opened
+    except OSError as error:
+        close_workspace_file(opened)
+        if error.errno in {
+            errno.ELOOP,
+            errno.ENOENT,
+            errno.ENOTDIR,
+            errno.EACCES,
+            errno.EPERM,
+        }:
+            raise RuntimeOperationError(
+                "workspace_changed_during_export",
+                "export.build",
+                "Workspace changed while building the export",
+                409,
+                {"path": "/".join(parts)},
+            ) from None
+        raise RuntimeOperationError(
+            "export_file_read_failed",
+            "export.build",
+            "Failed to read a workspace file",
+            500,
+            {"path": "/".join(parts), "reason": str(error)},
+        ) from error
+
+
+def zip_timestamp(value: float):
+    try:
+        converted = datetime.fromtimestamp(value)
+        if 1980 <= converted.year <= 2107:
+            return converted.timetuple()[:6]
+    except (OSError, OverflowError, ValueError):
+        pass
+    return (1980, 1, 1, 0, 0, 0)
+
+
+def make_workspace_zip(
+    session_id: str,
+    max_files: int = MAX_EXPORT_FILE_COUNT,
+    max_uncompressed_bytes: int = MAX_EXPORT_UNCOMPRESSED_BYTES,
+    max_archive_bytes: int = MAX_EXPORT_ARCHIVE_BYTES,
+):
+    root = session_path(session_id)
+    entries, directories, skipped_count, total_bytes = scan_workspace_export(
+        root, max_files, max_uncompressed_bytes
+    )
+    root_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    root_flags |= getattr(os, "O_DIRECTORY", 0)
+    root_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(root, root_flags)
+    except OSError as error:
+        raise RuntimeOperationError(
+            "workspace_not_found",
+            "export.build",
+            "Workspace is not available",
+            404,
+            {"reason": str(error)},
+        ) from error
+
+    archive_file = tempfile.TemporaryFile(mode="w+b")
+    try:
+        with zipfile.ZipFile(
+            archive_file,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+            allowZip64=True,
+        ) as archive:
+            for directory in directories:
+                info = zipfile.ZipInfo(directory, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_STORED
+                info.external_attr = (stat.S_IFDIR | 0o755) << 16
+                archive.writestr(info, b"")
+            for entry in entries:
+                file_fd, opened = open_export_file(root_fd, entry["parts"])
+                try:
+                    before = os.fstat(file_fd)
+                    if (
+                        not stat.S_ISREG(before.st_mode)
+                        or before.st_size != entry["size"]
+                        or before.st_mtime_ns != entry["mtime_ns"]
+                        or before.st_ino != entry["inode"]
+                    ):
+                        raise RuntimeOperationError(
+                            "workspace_changed_during_export",
+                            "export.build",
+                            "Workspace changed while building the export",
+                            409,
+                            {"path": entry["path"]},
+                        )
+                    info = zipfile.ZipInfo(
+                        entry["path"], date_time=zip_timestamp(entry["mtime"])
+                    )
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.external_attr = (stat.S_IFREG | entry["mode"]) << 16
+                    info.file_size = entry["size"]
+                    copied = 0
+                    with archive.open(info, mode="w", force_zip64=True) as target:
+                        while copied < entry["size"]:
+                            chunk = os.read(
+                                file_fd,
+                                min(
+                                    FILE_TRANSFER_IO_CHUNK_BYTES,
+                                    entry["size"] - copied,
+                                ),
+                            )
+                            if not chunk:
+                                break
+                            target.write(chunk)
+                            copied += len(chunk)
+                        trailing = os.read(file_fd, 1)
+                    after = os.fstat(file_fd)
+                    if (
+                        copied != entry["size"]
+                        or trailing
+                        or after.st_size != before.st_size
+                        or after.st_mtime_ns != before.st_mtime_ns
+                    ):
+                        raise RuntimeOperationError(
+                            "workspace_changed_during_export",
+                            "export.build",
+                            "Workspace changed while building the export",
+                            409,
+                            {"path": entry["path"]},
+                        )
+                finally:
+                    close_workspace_file(opened)
+        archive_file.flush()
+        archive_size = os.fstat(archive_file.fileno()).st_size
+        if archive_size > max_archive_bytes:
+            raise RuntimeOperationError(
+                "export_archive_size_exceeded",
+                "export.build",
+                "Workspace ZIP archive is too large",
+                413,
+                {"maxBytes": max_archive_bytes, "actualBytes": archive_size},
+            )
+        archive_file.seek(0)
+        return archive_file, {
+            "fileCount": len(entries),
+            "uncompressedBytes": total_bytes,
+            "archiveBytes": archive_size,
+            "skippedCount": skipped_count,
+        }
+    except RuntimeOperationError:
+        archive_file.close()
+        raise
+    except Exception as error:
+        archive_file.close()
+        raise RuntimeOperationError(
+            "export_build_failed",
+            "export.build",
+            f"Failed to build workspace ZIP: {error}",
+            500,
+        ) from error
+    finally:
+        os.close(root_fd)
+
+
+def serve_workspace_zip(handler, session_id: str):
+    with workspace_file_transfer(session_id, "export.lock"):
+        archive_file, metadata = make_workspace_zip(session_id)
+        filename = f"workspace-{safe_name(session_id)}.zip"
+        try:
+            handler.send_response(200)
+            handler.send_header("content-type", "application/zip")
+            handler.send_header("content-length", str(metadata["archiveBytes"]))
+            handler.send_header(
+                "content-disposition",
+                f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename, safe='')}",
+            )
+            handler.send_header("cache-control", "private, no-store")
+            handler.send_header("x-content-type-options", "nosniff")
+            handler.send_header("x-file-count", str(metadata["fileCount"]))
+            handler.send_header(
+                "x-uncompressed-size", str(metadata["uncompressedBytes"])
+            )
+            handler.end_headers()
+            shutil.copyfileobj(
+                archive_file,
+                handler.wfile,
+                length=FILE_TRANSFER_IO_CHUNK_BYTES,
+            )
+        finally:
+            archive_file.close()
+
+
 def should_skip_workspace_name(name: str, show_hidden: bool) -> bool:
     if name in IGNORED_WORKSPACE_DIRS:
         return True
@@ -678,6 +1719,18 @@ def write_json(handler, status: int, data):
     handler.send_response(status)
     handler.send_header("content-type", "application/json; charset=utf-8")
     handler.send_header("content-length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def write_upload_response(handler, result):
+    body = json.dumps(result, indent=2, ensure_ascii=False).encode()
+    handler.send_response(200)
+    handler.send_header("content-type", "application/json; charset=utf-8")
+    handler.send_header("content-length", str(len(body)))
+    handler.send_header("etag", f'"{result["etag"]}"')
+    handler.send_header("cache-control", "private, no-store")
+    handler.send_header("x-content-type-options", "nosniff")
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -1153,6 +2206,8 @@ def ensure_agent_tmux(
 
 def archive_path_is_excluded(relative: PurePosixPath) -> bool:
     parts = relative.parts
+    if any(part.startswith(UPLOAD_TEMP_PREFIX) for part in parts):
+        return True
     if any(part in ARCHIVE_EXCLUDED_DIR_NAMES for part in parts):
         return True
     return any(parts[: len(prefix)] == prefix for prefix in ARCHIVE_EXCLUDED_PATHS)
@@ -1700,6 +2755,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) in {2, 3} and parts[0] == "files":
                 query = parse_qs(parsed.query)
                 show_hidden = query.get("showHidden", ["false"])[0].lower() == "true"
+                if len(parts) == 3 and parts[2] == "download-all":
+                    serve_workspace_zip(self, parts[1])
+                    return
                 if len(parts) == 3 and parts[2] == "status":
                     write_json(
                         self,
@@ -1828,11 +2886,51 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         parsed = urlparse(self.path)
         parts = [unquote(part) for part in parsed.path.split("/") if part]
-        if len(parts) != 2 or parts[0] != "restore":
-            write_json(self, 404, {"ok": False, "error": "not_found", "path": parsed.path})
-            return
-        length = int(self.headers.get("content-length", "0"))
         try:
+            if len(parts) == 3 and parts[0] == "files" and parts[2] == "upload":
+                raw_length = (self.headers.get("content-length") or "").strip()
+                if not raw_length.isdigit():
+                    raise upload_error(
+                        "content_length_required",
+                        411,
+                        "A valid Content-Length header is required",
+                        stage="upload.request",
+                    )
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                requested_paths = query.get("path")
+                if not requested_paths or len(requested_paths) != 1:
+                    raise upload_error(
+                        "invalid_path",
+                        400,
+                        "Exactly one upload path is required",
+                        stage="upload.path",
+                    )
+                result = upload_workspace_file(
+                    parts[1],
+                    requested_paths[0],
+                    self.rfile,
+                    int(raw_length),
+                    if_match=self.headers.get("if-match", ""),
+                    if_none_match=self.headers.get("if-none-match", ""),
+                    workspace_max_bytes=self.headers.get(
+                        "x-workspace-max-bytes",
+                        str(DEFAULT_WORKSPACE_MAX_BYTES),
+                    ),
+                )
+                write_upload_response(self, result)
+                return
+            if len(parts) != 2 or parts[0] != "restore":
+                write_json(self, 404, {"ok": False, "error": "not_found", "path": parsed.path})
+                return
+            raw_length = (self.headers.get("content-length") or "").strip()
+            if not raw_length.isdigit():
+                raise RuntimeOperationError(
+                    "content_length_required",
+                    "restore.request",
+                    "A valid Content-Length header is required",
+                    411,
+                )
+            length = int(raw_length)
             active_agents = sorted(
                 agent for agent in AGENTS if tmux_exists(parts[1], agent)
             )
@@ -1856,7 +2954,13 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
         except Exception as error:
-            write_runtime_error(self, error, "restore.request")
+            write_runtime_error(
+                self,
+                error,
+                "upload.request"
+                if len(parts) == 3 and parts[0] == "files"
+                else "restore.request",
+            )
 
     def setup(self):
         super().setup()

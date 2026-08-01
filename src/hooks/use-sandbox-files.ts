@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { apiGet } from '@/lib/api-client';
 import {
@@ -12,6 +12,10 @@ import {
   type WorkspaceStatusPollTarget,
   type WorkspaceStatusResult,
 } from '@/lib/code-files';
+import {
+  downloadSandboxArchive,
+  uploadSandboxFile,
+} from '@/lib/sandbox-file-transfer';
 
 function filesEndpoint(sessionId: string, params: Record<string, string> = {}) {
   const search = new URLSearchParams(params);
@@ -63,6 +67,42 @@ export function sandboxFileRawUrl(
     path,
     raw: 'true',
     ...(etag ? { v: etag } : {}),
+  });
+}
+
+export function useSandboxFileUpload(sessionId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (options: {
+      file: File;
+      path: string;
+      signal?: AbortSignal;
+    }) => {
+      if (!sessionId) throw new Error('session_not_available');
+      return uploadSandboxFile({ sessionId, ...options });
+    },
+    onSuccess: async () => {
+      if (!sessionId) return;
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ['code-files', sessionId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['code-workspace-status', sessionId],
+        }),
+      ]);
+    },
+  });
+}
+
+export function useSandboxDownloadAll(sessionId: string | null) {
+  return useMutation({
+    mutationFn: () => {
+      if (!sessionId) throw new Error('session_not_available');
+      downloadSandboxArchive(sessionId);
+      return Promise.resolve();
+    },
   });
 }
 
