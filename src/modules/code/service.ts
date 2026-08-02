@@ -6,6 +6,8 @@ import {
   gte,
   inArray,
   isNotNull,
+  isNull,
+  like,
   lt,
   or,
 } from 'drizzle-orm';
@@ -76,9 +78,83 @@ export interface CodeSessionView {
   archiveKey: string | null;
   archiveDigest: string | null;
   suspensionReason: string;
+  deletionPending: boolean;
   lastActiveAt: string;
   endedAt: string | null;
   createdAt: string;
+}
+
+type PermanentDeletionReason = 'delete-permanently' | 'discard';
+type PermanentlyDeletableStatus = 'active' | 'suspended' | 'ended';
+
+interface PermanentDeletionState {
+  reason: PermanentDeletionReason;
+  originalStatus: PermanentlyDeletableStatus;
+  cutoffMs: number;
+  billingSettled: boolean;
+  runtimeCleaned: boolean;
+  runtimeAction: 'destroy' | 'purge' | '';
+}
+
+const PERMANENT_DELETION_PENDING_PREFIX = 'delete_pending:';
+
+function serializePermanentDeletionState(state: PermanentDeletionState) {
+  return `${PERMANENT_DELETION_PENDING_PREFIX}${[
+    state.reason,
+    state.originalStatus,
+    state.cutoffMs,
+    state.billingSettled ? '1' : '0',
+    state.runtimeCleaned ? '1' : '0',
+    state.runtimeAction || '-',
+  ].join(':')}`;
+}
+
+function parsePermanentDeletionState(
+  suspensionReason: string | null | undefined
+): PermanentDeletionState | null {
+  if (!suspensionReason?.startsWith(PERMANENT_DELETION_PENDING_PREFIX)) {
+    return null;
+  }
+  const [reason, originalStatus, cutoff, billing, runtime, runtimeAction] =
+    suspensionReason.slice(PERMANENT_DELETION_PENDING_PREFIX.length).split(':');
+  const cutoffMs = Number(cutoff);
+  if (
+    (reason !== 'delete-permanently' && reason !== 'discard') ||
+    (originalStatus !== 'active' &&
+      originalStatus !== 'suspended' &&
+      originalStatus !== 'ended') ||
+    !Number.isSafeInteger(cutoffMs) ||
+    cutoffMs <= 0 ||
+    (billing !== '0' && billing !== '1') ||
+    (runtime !== '0' && runtime !== '1') ||
+    (runtimeAction !== '-' &&
+      runtimeAction !== 'destroy' &&
+      runtimeAction !== 'purge')
+  ) {
+    return null;
+  }
+  return {
+    reason,
+    originalStatus,
+    cutoffMs,
+    billingSettled: billing === '1',
+    runtimeCleaned: runtime === '1',
+    runtimeAction: runtimeAction === '-' ? '' : runtimeAction,
+  };
+}
+
+function isPermanentDeletionPending(
+  row: Pick<CodeSession, 'suspensionReason'>
+) {
+  return Boolean(parsePermanentDeletionState(row.suspensionReason));
+}
+
+function assertSessionIsNotPendingDeletion(
+  row: Pick<CodeSession, 'suspensionReason'>
+) {
+  if (isPermanentDeletionPending(row)) {
+    throw new Error('Session is pending permanent deletion; retry deletion');
+  }
 }
 
 export type CodeSessionStartErrorReason =
@@ -194,6 +270,7 @@ export function toView(row: CodeSession): CodeSessionView {
     archiveKey: row.archiveKey,
     archiveDigest: row.archiveDigest,
     suspensionReason: row.suspensionReason || '',
+    deletionPending: isPermanentDeletionPending(row),
     lastActiveAt: asIso(row.lastActiveAt) || new Date().toISOString(),
     endedAt: asIso(row.endedAt),
     createdAt: asIso(row.createdAt) || new Date().toISOString(),
@@ -222,10 +299,18 @@ export async function listArchivedSessions(
       and(
         eq(codeSession.userId, userId),
         or(
-          eq(codeSession.status, 'suspended'),
-          eq(codeSession.status, 'ended')
-        ),
-        isNotNull(codeSession.archiveKey)
+          and(
+            or(
+              eq(codeSession.status, 'suspended'),
+              eq(codeSession.status, 'ended')
+            ),
+            isNotNull(codeSession.archiveKey)
+          ),
+          like(
+            codeSession.suspensionReason,
+            `${PERMANENT_DELETION_PENDING_PREFIX}%`
+          )
+        )
       )
     )
     .orderBy(desc(codeSession.lastActiveAt))
@@ -795,6 +880,7 @@ interface RuntimeJsonOptions {
   maxBytes?: number;
   retentionDays?: number;
   maxSnapshots?: number;
+  deferCleanup?: boolean;
 }
 
 const RUNTIME_ACTION_TIMEOUT_MS = 10 * 60_000;
@@ -848,6 +934,9 @@ async function runtimeJson(
   if (options.maxSnapshots !== undefined) {
     url.searchParams.set('maxSnapshots', String(options.maxSnapshots));
   }
+  if (options.deferCleanup !== undefined) {
+    url.searchParams.set('deferCleanup', options.deferCleanup ? '1' : '0');
+  }
   const headers = new Headers();
   if (options.archiveKey) {
     headers.set('x-hicode-archive-key', options.archiveKey);
@@ -861,6 +950,7 @@ async function runtimeJson(
     action === 'archive' ||
     action === 'restore' ||
     action === 'clear' ||
+    action === 'purge' ||
     action === 'destroy' ||
     action === 'tmux' ||
     action === 'container-health';
@@ -1133,11 +1223,20 @@ export async function releaseArchiveLock(row: CodeSession, token: string) {
     );
 }
 
+interface PreparedArchiveRuntime {
+  archive: RuntimeActionResult;
+  reservationId: string;
+  key: string;
+  sizeBytes: number;
+  deduplicated: boolean;
+  configs: Record<string, string>;
+}
+
 async function archiveRuntimeWithQuotaLocked(
   row: CodeSession,
   preferHistory: boolean,
   storageLockToken: string
-): Promise<RuntimeActionResult> {
+): Promise<PreparedArchiveRuntime> {
   const configs = await getAllConfigs();
   const storageSettings = getCodeStorageSettings(configs);
   await reconcileUserStorage(row.userId, configs, {
@@ -1215,6 +1314,7 @@ async function archiveRuntimeWithQuotaLocked(
           maxBytes: requestedBytes,
           retentionDays: storageSettings.retentionDays,
           maxSnapshots: storageSettings.maxSnapshotsPerSession,
+          deferCleanup: true,
         }
       );
     } catch (error) {
@@ -1268,33 +1368,14 @@ async function archiveRuntimeWithQuotaLocked(
         );
       }
     }
-    try {
-      await recordRuntimeArchiveResult({
-        reservationId,
-        key,
-        sizeBytes,
-        digest:
-          stringField(archive, 'workspaceDigest') ||
-          stringField(archive, 'archiveSha256') ||
-          null,
-        deduplicated,
-        deletedKeys: stringArrayField(archive, 'deletedKeys'),
-        configs,
-        lockToken: storageLockToken,
-      });
-      return archive;
-    } catch (error) {
-      // The R2 write may already be durable. Keep its net reservation charged
-      // for reconciliation instead of releasing quota and creating an
-      // unaccounted orphan.
-      await holdReservationForReconciliation(
-        reservationId,
-        sizeBytes,
-        key,
-        storageLockToken
-      );
-      throw error;
-    }
+    return {
+      archive,
+      reservationId,
+      key,
+      sizeBytes,
+      deduplicated,
+      configs,
+    };
   };
 
   const initialStorage = await getUserStorage(row.userId, configs);
@@ -1320,6 +1401,58 @@ async function archiveRuntimeWithQuotaLocked(
   }
 }
 
+async function finalizeDeferredArchiveCleanup(
+  row: CodeSession,
+  archive: RuntimeActionResult
+) {
+  const keys = [...new Set(stringArrayField(archive, 'cleanupCandidateKeys'))];
+  if (keys.length === 0) return [];
+
+  const deleted: Array<{ key: string; bytes: number; reason?: string }> = [];
+  const deletedKeys: string[] = [];
+  const notFound: string[] = [];
+  const failed: Array<{ key: string; error: string }> = [];
+
+  for (let offset = 0; offset < keys.length; offset += 100) {
+    const batch = keys.slice(offset, offset + 100);
+    try {
+      const result = await deleteRuntimeArchives({
+        runtimeUserId: row.runtimeUserId,
+        sessionId: row.id,
+        keys: batch,
+      });
+      deleted.push(...(result.deleted || []));
+      deletedKeys.push(...(result.deletedKeys || []));
+      notFound.push(...(result.notFound || []));
+      failed.push(...(result.failed || []));
+    } catch (error) {
+      failed.push(
+        ...batch.map((key) => ({
+          key,
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      );
+    }
+  }
+
+  const confirmed = new Set([...deletedKeys, ...notFound]);
+  const failedKeys = new Set(failed.map((item) => item.key));
+  for (const key of keys) {
+    if (!confirmed.has(key) && !failedKeys.has(key)) {
+      failed.push({ key, error: 'Archive deletion was not confirmed' });
+    }
+  }
+
+  archive.deleted = deleted;
+  archive.deletedKeys = [...confirmed];
+  archive.cleanupFailed = [
+    ...(Array.isArray(archive.cleanupFailed) ? archive.cleanupFailed : []),
+    ...failed,
+  ];
+
+  return [...confirmed];
+}
+
 async function beginArchiveRuntimeWithQuota(
   row: CodeSession,
   preferHistory = true
@@ -1335,30 +1468,98 @@ async function beginArchiveRuntimeWithQuota(
     const archive = await withStorageMutationHeartbeat(
       row.userId,
       storageLockToken,
-      () => archiveRuntimeWithQuotaLocked(row, preferHistory, storageLockToken)
+      async () => {
+        const locked = await getOwnedSession(row.userId, row.id);
+        if (
+          !locked ||
+          locked.archiveLockToken !== lockToken ||
+          locked.status !== 'active'
+        ) {
+          throw new StorageConflictError(
+            'Session changed before the workspace could be archived'
+          );
+        }
+        assertSessionIsNotPendingDeletion(locked);
+        const expectedArchiveKey = locked.archiveKey;
+        const prepared = await archiveRuntimeWithQuotaLocked(
+          locked,
+          preferHistory,
+          storageLockToken
+        );
+        const {
+          archive: preparedArchive,
+          reservationId,
+          key,
+          sizeBytes,
+          deduplicated,
+          configs,
+        } = prepared;
+        const now = new Date();
+        const changed = await db()
+          .update(codeSession)
+          .set({
+            archiveKey: key,
+            archiveDigest: digestFromArchive(preparedArchive),
+            lastActiveAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(codeSession.userId, locked.userId),
+              eq(codeSession.id, locked.id),
+              eq(codeSession.archiveLockToken, lockToken),
+              expectedArchiveKey === null
+                ? isNull(codeSession.archiveKey)
+                : eq(codeSession.archiveKey, expectedArchiveKey)
+            )
+          );
+        if (affectedRowCount(changed) !== 1) {
+          if (deduplicated) {
+            await releaseReservation(reservationId, storageLockToken).catch(
+              () => undefined
+            );
+          }
+          throw new StorageConflictError(
+            'Archive pointer could not be updated safely'
+          );
+        }
+
+        const confirmedCleanupKeys = deduplicated
+          ? stringArrayField(preparedArchive, 'deletedKeys')
+          : await finalizeDeferredArchiveCleanup(locked, preparedArchive);
+        try {
+          await recordRuntimeArchiveResult({
+            reservationId,
+            key,
+            sizeBytes,
+            digest:
+              stringField(preparedArchive, 'workspaceDigest') ||
+              stringField(preparedArchive, 'archiveSha256') ||
+              null,
+            deduplicated,
+            deletedKeys: confirmedCleanupKeys,
+            configs,
+            lockToken: storageLockToken,
+          });
+        } catch (error) {
+          // The pointer now references the durable object. Preserve the
+          // reservation so reconciliation can rebuild the ledger without
+          // reverting that pointer.
+          await holdReservationForReconciliation(
+            reservationId,
+            sizeBytes,
+            key,
+            storageLockToken
+          ).catch(() => undefined);
+          await reconcileUserStorage(locked.userId, configs, {
+            force: true,
+            lockToken: storageLockToken,
+          }).catch(() => undefined);
+          throw error;
+        }
+        return preparedArchive;
+      }
     );
-    const key =
-      stringField(archive, 'currentKey') || stringField(archive, 'key');
-    const changed = await db()
-      .update(codeSession)
-      .set({
-        archiveKey: key,
-        archiveDigest: digestFromArchive(archive),
-        lastActiveAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(codeSession.userId, row.userId),
-          eq(codeSession.id, row.id),
-          eq(codeSession.archiveLockToken, lockToken)
-        )
-      );
-    if (affectedRowCount(changed) !== 1) {
-      throw new StorageConflictError(
-        'Archive pointer could not be updated safely'
-      );
-    }
     return { archive, lockToken, storageLockToken };
   } catch (error) {
     if (storageLockToken) {
@@ -1435,89 +1636,117 @@ export async function archiveSession(userId: string, sessionId: string) {
   }
 }
 
+async function restoreWorkspaceUnderLifecycleLock(row: CodeSession) {
+  if (!row.archiveKey) throw new Error('Archived workspace not found');
+  const restore = await runtimeJson(
+    'restore',
+    row.runtimeUserId,
+    row.id,
+    'POST',
+    normalizeAgent(row.agent),
+    row.model,
+    { archiveKey: row.archiveKey }
+  );
+  let restoreIntegrity = restoreIntegrityFromResult(row, restore);
+  const legacyArchive = booleanField(restore, 'legacyArchive') === true;
+  if (
+    restoreIntegrity.state === 'mismatch' &&
+    legacyArchive &&
+    restoreIntegrity.restoredDigest
+  ) {
+    const changed = await db()
+      .update(codeSession)
+      .set({
+        archiveDigest: restoreIntegrity.restoredDigest,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(codeSession.userId, row.userId),
+          eq(codeSession.id, row.id),
+          eq(codeSession.archiveLockToken, row.archiveLockToken)
+        )
+      );
+    if (affectedRowCount(changed) !== 1) {
+      throw new StorageConflictError(
+        'Legacy archive digest could not be reconciled under the lifecycle lock'
+      );
+    }
+    restoreIntegrity = { ...restoreIntegrity, state: 'reconciled' };
+    await recordCodeSessionEvent({
+      userId: row.userId,
+      sessionId: row.id,
+      runtimeUserId: row.runtimeUserId,
+      agent: row.agent,
+      model: row.model,
+      eventType: 'session.restore.integrity_reconciled',
+      severity: 'warn',
+      message: 'Legacy archive digest reconciled after verified extraction',
+      metadata: {
+        restoreIntegrity,
+        restore: pickRuntimeFields(restore),
+      },
+    });
+  }
+  if (restoreIntegrity.state === 'mismatch') {
+    await recordCodeSessionEvent({
+      userId: row.userId,
+      sessionId: row.id,
+      runtimeUserId: row.runtimeUserId,
+      agent: row.agent,
+      model: row.model,
+      eventType: 'session.restore.integrity_failed',
+      severity: 'error',
+      message: 'Restored workspace digest mismatch',
+      metadata: {
+        restoreIntegrity,
+        restore: pickRuntimeFields(restore),
+      },
+    });
+    throw new Error('Restored workspace digest mismatch');
+  }
+  if (restoreIntegrity.state === 'unknown') {
+    await recordCodeSessionEvent({
+      userId: row.userId,
+      sessionId: row.id,
+      runtimeUserId: row.runtimeUserId,
+      agent: row.agent,
+      model: row.model,
+      eventType: 'session.restore.integrity_unknown',
+      severity: 'warn',
+      message: 'Restored workspace digest was not reported',
+      metadata: {
+        restoreIntegrity,
+        restore: pickRuntimeFields(restore),
+      },
+    });
+  }
+  return { restore, restoreIntegrity };
+}
+
 export async function restoreSession(userId: string, sessionId: string) {
-  const row = await getOwnedSession(userId, sessionId);
+  let row = await getOwnedSession(userId, sessionId);
   if (!row) throw new Error('Session not found');
   if (row.status !== 'active') throw new Error('Session is not active');
 
   const archiveLockToken = await acquireArchiveLock(row);
+  let storageLockToken = '';
   try {
-    const restore = await runtimeJson(
-      'restore',
-      row.runtimeUserId,
-      sessionId,
-      'POST',
-      normalizeAgent(row.agent),
-      row.model,
-      { archiveKey: row.archiveKey }
-    );
-    let restoreIntegrity = restoreIntegrityFromResult(row, restore);
-    const legacyArchive = booleanField(restore, 'legacyArchive') === true;
+    storageLockToken = await acquireStorageMutationLock(userId);
+    const locked = await getOwnedSession(userId, sessionId);
     if (
-      restoreIntegrity.state === 'mismatch' &&
-      legacyArchive &&
-      restoreIntegrity.restoredDigest
+      !locked ||
+      locked.archiveLockToken !== archiveLockToken ||
+      locked.status !== 'active'
     ) {
-      await db()
-        .update(codeSession)
-        .set({
-          archiveDigest: restoreIntegrity.restoredDigest,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(eq(codeSession.userId, userId), eq(codeSession.id, sessionId))
-        );
-      restoreIntegrity = { ...restoreIntegrity, state: 'reconciled' };
-      await recordCodeSessionEvent({
-        userId,
-        sessionId,
-        runtimeUserId: row.runtimeUserId,
-        agent: row.agent,
-        model: row.model,
-        eventType: 'session.restore.integrity_reconciled',
-        severity: 'warn',
-        message: 'Legacy archive digest reconciled after verified extraction',
-        metadata: {
-          restoreIntegrity,
-          restore: pickRuntimeFields(restore),
-        },
-      });
+      throw new StorageConflictError(
+        'Session changed before the workspace could be restored'
+      );
     }
-    if (restoreIntegrity.state === 'mismatch') {
-      await recordCodeSessionEvent({
-        userId,
-        sessionId,
-        runtimeUserId: row.runtimeUserId,
-        agent: row.agent,
-        model: row.model,
-        eventType: 'session.restore.integrity_failed',
-        severity: 'error',
-        message: 'Restored workspace digest mismatch',
-        metadata: {
-          restoreIntegrity,
-          restore: pickRuntimeFields(restore),
-        },
-      });
-      throw new Error('Restored workspace digest mismatch');
-    }
-
+    row = locked;
+    const { restore, restoreIntegrity } =
+      await restoreWorkspaceUnderLifecycleLock(row);
     const session = await touchSession(userId, sessionId);
-    if (restoreIntegrity.state === 'unknown') {
-      await recordCodeSessionEvent({
-        userId,
-        sessionId,
-        runtimeUserId: row.runtimeUserId,
-        agent: row.agent,
-        model: row.model,
-        eventType: 'session.restore.integrity_unknown',
-        severity: 'warn',
-        message: 'Restored workspace digest was not reported',
-        metadata: {
-          restoreIntegrity,
-          restore: pickRuntimeFields(restore),
-        },
-      });
-    }
     await recordCodeSessionEvent({
       userId,
       sessionId,
@@ -1547,20 +1776,44 @@ export async function restoreSession(userId: string, sessionId: string) {
     });
     throw error;
   } finally {
+    if (storageLockToken) {
+      await releaseStorageMutationLock(userId, storageLockToken).catch(
+        () => undefined
+      );
+    }
     await releaseArchiveLock(row, archiveLockToken).catch(() => undefined);
   }
 }
 
 export async function resumeArchivedSession(userId: string, sessionId: string) {
-  const row = await getOwnedSession(userId, sessionId);
+  let row = await getOwnedSession(userId, sessionId);
   if (!row) throw new Error('Session not found');
+  assertSessionIsNotPendingDeletion(row);
   if (row.status !== 'ended' && row.status !== 'suspended') {
     throw new Error('Session is not restorable');
   }
   if (!row.archiveKey) throw new Error('Archived workspace not found');
 
   const archiveLockToken = await acquireArchiveLock(row);
+  let storageLockToken = '';
   try {
+    storageLockToken = await acquireStorageMutationLock(userId);
+    const locked = await getOwnedSession(userId, sessionId);
+    if (!locked || locked.archiveLockToken !== archiveLockToken) {
+      throw new StorageConflictError(
+        'Archived session changed before it could be resumed'
+      );
+    }
+    assertSessionIsNotPendingDeletion(locked);
+    if (
+      (locked.status !== 'ended' && locked.status !== 'suspended') ||
+      !locked.archiveKey
+    ) {
+      throw new StorageConflictError(
+        'Archived session changed before it could be resumed'
+      );
+    }
+    row = locked;
     const model = await getCodeModelForBilling(row.agent, row.model);
     await ensureCanStartBillableSession(userId, model || undefined);
 
@@ -1576,6 +1829,8 @@ export async function resumeArchivedSession(userId: string, sessionId: string) {
       throw new Error('Suspend or end the current session before restoring');
     }
 
+    const { restore, restoreIntegrity } =
+      await restoreWorkspaceUnderLifecycleLock(row);
     const now = new Date();
     const changed = await db()
       .update(codeSession)
@@ -1609,6 +1864,19 @@ export async function resumeArchivedSession(userId: string, sessionId: string) {
       runtimeUserId: resumed.runtimeUserId,
       agent: resumed.agent,
       model: resumed.model,
+      eventType: 'session.restore',
+      message: 'Workspace restored before session resume',
+      metadata: {
+        ...pickRuntimeFields(restore),
+        restoreIntegrity,
+      },
+    });
+    await recordCodeSessionEvent({
+      userId,
+      sessionId,
+      runtimeUserId: resumed.runtimeUserId,
+      agent: resumed.agent,
+      model: resumed.model,
       eventType: 'session.resumed',
       message: 'Archived session resumed',
       metadata: {
@@ -1619,8 +1887,31 @@ export async function resumeArchivedSession(userId: string, sessionId: string) {
       },
     });
 
-    return { session: toView(resumed), restorePending: true };
+    return {
+      session: toView(resumed),
+      restorePending: false,
+      restore,
+      restoreIntegrity,
+    };
+  } catch (error) {
+    await recordCodeSessionEvent({
+      userId,
+      sessionId,
+      runtimeUserId: row.runtimeUserId,
+      agent: row.agent,
+      model: row.model,
+      eventType: 'session.resume.failed',
+      severity: 'warn',
+      message: (error as Error).message,
+      metadata: runtimeErrorMetadata(error),
+    });
+    throw error;
   } finally {
+    if (storageLockToken) {
+      await releaseStorageMutationLock(userId, storageLockToken).catch(
+        () => undefined
+      );
+    }
     await releaseArchiveLock(row, archiveLockToken).catch(() => undefined);
   }
 }
@@ -1631,6 +1922,7 @@ export async function preflightSessionResume(
 ) {
   const row = await getOwnedSession(userId, sessionId);
   if (!row) throw new Error('Session not found');
+  assertSessionIsNotPendingDeletion(row);
   if (row.status !== 'ended' && row.status !== 'suspended') {
     throw new Error('Session is not restorable');
   }
@@ -1648,14 +1940,6 @@ export async function suspendSession(userId: string, sessionId: string) {
 }
 
 async function destroyRuntimeForPermanentDelete(row: CodeSession) {
-  if (row.status !== 'active') {
-    return {
-      attempted: false,
-      skippedReason: 'session_not_active',
-      result: null,
-    };
-  }
-
   const activeRows = await db()
     .select({ id: codeSession.id })
     .from(codeSession)
@@ -1667,14 +1951,15 @@ async function destroyRuntimeForPermanentDelete(row: CodeSession) {
       )
     )
     .limit(2);
-  if (activeRows.some((active: { id: string }) => active.id !== row.id)) {
-    throw new StorageConflictError(
-      'Another active session exists; the shared Runtime container cannot be deleted safely'
-    );
-  }
+  const sharedByAnotherActiveSession = activeRows.some(
+    (active: { id: string }) => active.id !== row.id
+  );
+  const action: 'purge' | 'destroy' = sharedByAnotherActiveSession
+    ? 'purge'
+    : 'destroy';
 
   const result = await runtimeJson(
-    'destroy',
+    action,
     row.runtimeUserId,
     row.id,
     'POST',
@@ -1684,8 +1969,37 @@ async function destroyRuntimeForPermanentDelete(row: CodeSession) {
   return {
     attempted: true,
     skippedReason: null,
+    action,
     result: pickRuntimeFields(result),
   };
+}
+
+async function persistPermanentDeletionState(
+  row: CodeSession,
+  archiveLockToken: string,
+  state: PermanentDeletionState
+) {
+  const cutoff = new Date(state.cutoffMs);
+  const changed = await db()
+    .update(codeSession)
+    .set({
+      status: 'ended',
+      suspensionReason: serializePermanentDeletionState(state),
+      endedAt: cutoff,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(codeSession.userId, row.userId),
+        eq(codeSession.id, row.id),
+        eq(codeSession.archiveLockToken, archiveLockToken)
+      )
+    );
+  if (affectedRowCount(changed) !== 1) {
+    throw new StorageConflictError(
+      'Permanent deletion checkpoint could not be saved safely'
+    );
+  }
 }
 
 async function finalizePermanentSessionDeletion(
@@ -1832,11 +2146,15 @@ async function finalizePermanentSessionDeletion(
 async function permanentlyDeleteSessionWithReason(
   userId: string,
   sessionId: string,
-  reason: 'delete-permanently' | 'discard'
+  reason: PermanentDeletionReason
 ) {
-  const row = await getOwnedSession(userId, sessionId);
+  let row = await getOwnedSession(userId, sessionId);
   if (!row) throw new Error('Session not found');
+  const existingDeletionState = parsePermanentDeletionState(
+    row.suspensionReason
+  );
   if (
+    !existingDeletionState &&
     row.status !== 'active' &&
     row.status !== 'suspended' &&
     row.status !== 'ended'
@@ -1853,38 +2171,59 @@ async function permanentlyDeleteSessionWithReason(
     // action. A lock conflict must never leave an active DB row whose Runtime
     // was already destroyed.
     storageLockToken = await acquireStorageMutationLock(userId);
-    let runtime: Awaited<ReturnType<typeof destroyRuntimeForPermanentDelete>>;
-    let billing: unknown = null;
-    try {
-      runtime = await withStorageMutationHeartbeat(
-        userId,
-        storageLockToken,
-        () => destroyRuntimeForPermanentDelete(row)
+    const locked = await getOwnedSession(userId, sessionId);
+    if (!locked || locked.archiveLockToken !== archiveLockToken) {
+      throw new StorageConflictError(
+        'Session changed before permanent deletion could start'
       );
-    } catch (error) {
-      await recordCodeSessionEvent({
-        userId,
-        sessionId,
-        runtimeUserId: row.runtimeUserId,
-        agent: row.agent,
-        model: row.model,
-        eventType: `session.${reason}.failed`,
-        severity: 'error',
-        message: (error as Error).message || 'Runtime destruction failed',
-        metadata: { stage: 'runtime.destroy', previousStatus: row.status },
-      });
-      throw error;
     }
+    row = locked;
 
-    if (row.status === 'active') {
+    let deletionState = parsePermanentDeletionState(row.suspensionReason);
+    if (!deletionState) {
+      if (
+        row.status !== 'active' &&
+        row.status !== 'suspended' &&
+        row.status !== 'ended'
+      ) {
+        throw new Error(
+          'Session cannot be permanently deleted in its current state'
+        );
+      }
+      deletionState = {
+        reason,
+        originalStatus: row.status as PermanentlyDeletableStatus,
+        cutoffMs: Date.now(),
+        billingSettled: row.status !== 'active',
+        runtimeCleaned: false,
+        runtimeAction: '',
+      };
+      await persistPermanentDeletionState(row, archiveLockToken, deletionState);
+    }
+    let state = deletionState as PermanentDeletionState;
+    const effectiveReason = state.reason;
+
+    let runtime:
+      | Awaited<ReturnType<typeof destroyRuntimeForPermanentDelete>>
+      | {
+          attempted: false;
+          skippedReason: 'already_cleaned';
+          action: 'destroy' | 'purge' | null;
+          result: null;
+        };
+    let billing: unknown = null;
+    if (state.originalStatus === 'active' && !state.billingSettled) {
       try {
         billing = await settleSessionRuntimeUsage({
           userId,
           sessionId,
           runtimeState: 'active',
-          endedAt: new Date(),
-          metadata: { reason },
+          endedAt: new Date(state.cutoffMs),
+          idempotencyKey: `permanent-delete:${sessionId}:${state.cutoffMs}`,
+          metadata: { reason: effectiveReason, permanentDeletion: true },
         });
+        state = { ...state, billingSettled: true };
+        await persistPermanentDeletionState(row, archiveLockToken, state);
       } catch (error) {
         await recordCodeSessionEvent({
           userId,
@@ -1893,10 +2232,50 @@ async function permanentlyDeleteSessionWithReason(
           agent: row.agent,
           model: row.model,
           eventType: 'session.billing.failed',
-          severity: 'warn',
+          severity: 'error',
           message: (error as Error).message,
-          metadata: { during: `session.${reason}` },
+          metadata: { during: `session.${effectiveReason}` },
         });
+        throw error;
+      }
+    }
+
+    if (state.runtimeCleaned) {
+      runtime = {
+        attempted: false,
+        skippedReason: 'already_cleaned',
+        action: state.runtimeAction || null,
+        result: null,
+      };
+    } else {
+      try {
+        runtime = await withStorageMutationHeartbeat(
+          userId,
+          storageLockToken,
+          () => destroyRuntimeForPermanentDelete(row)
+        );
+        state = {
+          ...state,
+          runtimeCleaned: true,
+          runtimeAction: runtime.action,
+        };
+        await persistPermanentDeletionState(row, archiveLockToken, state);
+      } catch (error) {
+        await recordCodeSessionEvent({
+          userId,
+          sessionId,
+          runtimeUserId: row.runtimeUserId,
+          agent: row.agent,
+          model: row.model,
+          eventType: `session.${effectiveReason}.failed`,
+          severity: 'error',
+          message: (error as Error).message || 'Runtime destruction failed',
+          metadata: {
+            stage: 'runtime.destroy',
+            previousStatus: state.originalStatus,
+          },
+        });
+        throw error;
       }
     }
 
@@ -1935,10 +2314,13 @@ async function permanentlyDeleteSessionWithReason(
         runtimeUserId: row.runtimeUserId,
         agent: row.agent,
         model: row.model,
-        eventType: `session.${reason}.failed`,
+        eventType: `session.${effectiveReason}.failed`,
         severity: 'error',
         message: (error as Error).message || 'Archive deletion failed',
-        metadata: { stage: 'storage.delete', previousStatus: row.status },
+        metadata: {
+          stage: 'storage.delete',
+          previousStatus: state.originalStatus,
+        },
       });
       throw error;
     }
@@ -2019,12 +2401,12 @@ async function permanentlyDeleteSessionWithReason(
         runtimeUserId: row.runtimeUserId,
         agent: row.agent,
         model: row.model,
-        eventType: `session.${reason}.failed`,
+        eventType: `session.${effectiveReason}.failed`,
         severity: 'error',
         message: error.message,
         metadata: {
           stage: 'storage.delete',
-          previousStatus: row.status,
+          previousStatus: state.originalStatus,
           failedKeys: physicalDelete.failed.map((item) => item.key),
         },
       });
@@ -2043,7 +2425,7 @@ async function permanentlyDeleteSessionWithReason(
     const result = {
       deleted: true as const,
       sessionId: row.id,
-      previousStatus: row.status as CodeSessionStatus,
+      previousStatus: state.originalStatus as CodeSessionStatus,
       runtime,
       storage: {
         scope: 'session' as const,
@@ -2062,15 +2444,15 @@ async function permanentlyDeleteSessionWithReason(
       agent: row.agent,
       model: row.model,
       eventType:
-        reason === 'discard'
+        effectiveReason === 'discard'
           ? 'session.discarded'
           : 'session.deleted_permanently',
       message:
-        reason === 'discard'
+        effectiveReason === 'discard'
           ? 'Session discarded and permanently deleted'
           : 'Session permanently deleted',
       metadata: {
-        previousStatus: row.status,
+        previousStatus: state.originalStatus,
         previousArchiveKey: row.archiveKey || '',
         runtime,
         storage: result.storage,
@@ -2078,7 +2460,14 @@ async function permanentlyDeleteSessionWithReason(
       },
     }).catch(() => undefined);
 
-    return { result, deletedRow: row };
+    return {
+      result,
+      deletedRow: {
+        ...row,
+        status: state.originalStatus,
+        suspensionReason: '',
+      },
+    };
   } finally {
     if (storageLockToken) {
       await releaseStorageMutationLock(userId, storageLockToken).catch(
@@ -2364,6 +2753,9 @@ async function suspendSessionRow(
         message: clearError,
         metadata: { during: 'session.suspend', reason: options.reason },
       });
+      // A suspended row promises that no live Runtime workspace remains.
+      // Keep the session active and retryable when cleanup cannot be confirmed.
+      throw error;
     }
 
     const suspendedAt = options.now || new Date();
@@ -2433,6 +2825,7 @@ async function suspendSessionRow(
 export async function endSession(userId: string, sessionId: string) {
   const row = await getOwnedSession(userId, sessionId);
   if (!row) throw new Error('Session not found');
+  assertSessionIsNotPendingDeletion(row);
 
   let archive: RuntimeActionResult | null = null;
   let archiveError: string | null = null;

@@ -903,6 +903,35 @@ async function cleanupSessionArchives(
     maxSnapshots?: number;
   } = {}
 ) {
+  const plan = await planSessionArchiveCleanup(
+    bucket,
+    userId,
+    sessionId,
+    currentKey,
+    versionObjects,
+    options
+  );
+  const result = await deleteArchiveObjects(bucket, plan.candidates);
+  return {
+    deleted: result.deleted,
+    failed: [...plan.preflightFailures, ...result.failed],
+  };
+}
+
+async function planSessionArchiveCleanup(
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  currentKey: string,
+  versionObjects: R2Object[],
+  options: {
+    now?: Date;
+    retainPrevious?: boolean;
+    previousObject?: R2Object | null;
+    retentionDays?: number;
+    maxSnapshots?: number;
+  } = {}
+) {
   const preflightFailures: ArchiveDeleteFailure[] = [];
   let temporaryObjects: R2Object[] = [];
   try {
@@ -944,11 +973,66 @@ async function cleanupSessionArchives(
     });
   }
 
-  const result = await deleteArchiveObjects(bucket, candidates);
   return {
-    deleted: result.deleted,
-    failed: [...preflightFailures, ...result.failed],
+    candidates,
+    preflightFailures,
   };
+}
+
+function requiredArchiveContentLength(response: Response): number {
+  const raw = response.headers.get('content-length');
+  if (!raw || !/^(?:0|[1-9]\d*)$/.test(raw)) {
+    throw new RuntimeOperationError(
+      502,
+      'archive_content_length_invalid',
+      'archive.upload',
+      'Container returned an invalid archive Content-Length'
+    );
+  }
+  const contentLength = Number(raw);
+  if (!Number.isSafeInteger(contentLength) || contentLength <= 0) {
+    throw new RuntimeOperationError(
+      502,
+      'archive_content_length_invalid',
+      'archive.upload',
+      'Container returned an invalid archive Content-Length'
+    );
+  }
+  return contentLength;
+}
+
+async function putFixedLengthArchive(
+  bucket: R2Bucket,
+  key: string,
+  body: ReadableStream<Uint8Array>,
+  contentLength: number,
+  metadata: Record<string, string>
+) {
+  const fixed = new FixedLengthStream(contentLength);
+  const pipe = body.pipeTo(fixed.writable);
+  try {
+    const [stored] = await Promise.all([
+      bucket.put(key, fixed.readable, {
+        httpMetadata: { contentType: 'application/gzip' },
+        customMetadata: metadata,
+      }),
+      pipe,
+    ]);
+    if (stored.size !== contentLength) {
+      await bucket.delete(key).catch(() => undefined);
+      throw new RuntimeOperationError(
+        502,
+        'archive_size_mismatch',
+        'archive.upload',
+        'Stored archive size does not match Content-Length',
+        { expectedBytes: contentLength, actualBytes: stored.size }
+      );
+    }
+    return stored;
+  } catch (error) {
+    await bucket.delete(key).catch(() => undefined);
+    throw error;
+  }
 }
 
 function container(env: Env, userId: string) {
@@ -1113,7 +1197,8 @@ async function archive(
   retainPrevious = true,
   maxBytes: number | null = null,
   retentionDays = 7,
-  maxSnapshots = 2
+  maxSnapshots = 2,
+  deferCleanup = false
 ) {
   if (
     targetArchiveKey &&
@@ -1142,7 +1227,13 @@ async function archive(
   const totalBytes = response.headers.get('x-workspace-total-bytes') || '0';
   const skippedFileCount = response.headers.get('x-skipped-file-count') || '0';
   const archiveFormat = response.headers.get('x-archive-format') || '2';
-  const contentLength = Number(response.headers.get('content-length'));
+  let contentLength: number;
+  try {
+    contentLength = requiredArchiveContentLength(response);
+  } catch (error) {
+    await response.body?.cancel().catch(() => undefined);
+    throw error;
+  }
   if (
     maxBytes !== null &&
     Number.isSafeInteger(contentLength) &&
@@ -1289,10 +1380,13 @@ async function archive(
     versionKey,
   };
 
-  const stored = await env.WORKSPACE_ARCHIVES.put(versionKey, response.body, {
-    httpMetadata: { contentType: 'application/gzip' },
-    customMetadata: metadata,
-  });
+  const stored = await putFixedLengthArchive(
+    env.WORKSPACE_ARCHIVES,
+    versionKey,
+    response.body,
+    contentLength,
+    metadata
+  );
   if (maxBytes !== null && stored.size > maxBytes) {
     await env.WORKSPACE_ARCHIVES.delete(versionKey);
     return json(
@@ -1310,20 +1404,34 @@ async function archive(
       { status: 413 }
     );
   }
-  const cleanup = await cleanupSessionArchives(
-    env.WORKSPACE_ARCHIVES,
-    userId,
-    sessionId,
-    versionKey,
-    [...versionObjects, stored],
-    {
-      now,
-      retainPrevious,
-      previousObject: previous,
-      retentionDays,
-      maxSnapshots,
-    }
-  );
+  const cleanupOptions = {
+    now,
+    retainPrevious,
+    previousObject: previous,
+    retentionDays,
+    maxSnapshots,
+  };
+  const cleanup = deferCleanup
+    ? await planSessionArchiveCleanup(
+        env.WORKSPACE_ARCHIVES,
+        userId,
+        sessionId,
+        versionKey,
+        [...versionObjects, stored],
+        cleanupOptions
+      ).then((plan) => ({
+        deleted: [] as ArchiveDeletedObject[],
+        failed: plan.preflightFailures,
+        candidates: plan.candidates,
+      }))
+    : await cleanupSessionArchives(
+        env.WORKSPACE_ARCHIVES,
+        userId,
+        sessionId,
+        versionKey,
+        [...versionObjects, stored],
+        cleanupOptions
+      ).then((result) => ({ ...result, candidates: [] }));
 
   return json({
     ok: true,
@@ -1344,6 +1452,14 @@ async function archive(
     requestedKeyMissing: resolved.requestedKeyMissing,
     deleted: cleanup.deleted,
     deletedKeys: cleanup.deleted.map((item) => item.key),
+    cleanupCandidates: cleanup.candidates.map((candidate) => ({
+      key: candidate.object.key,
+      bytes: candidate.object.size,
+      ...(candidate.reason ? { reason: candidate.reason } : {}),
+    })),
+    cleanupCandidateKeys: cleanup.candidates.map(
+      (candidate) => candidate.object.key
+    ),
     cleanupFailed: cleanup.failed,
   });
 }
@@ -2193,7 +2309,7 @@ export default {
     }
 
     const actionMatch = url.pathname.match(
-      /^\/(seed|inspect|archive|restore|clear|destroy|tmux|container-health)\/([^/]+)(?:\/([^/]+))?$/
+      /^\/(seed|inspect|archive|restore|clear|purge|destroy|tmux|container-health)\/([^/]+)(?:\/([^/]+))?$/
     );
     if (actionMatch) {
       const action = actionMatch[1];
@@ -2231,6 +2347,7 @@ export default {
           action === 'archive' ||
           action === 'restore' ||
           action === 'clear' ||
+          action === 'purge' ||
           action === 'destroy';
         const readAction = action === 'inspect' || action === 'tmux';
         const protectedAction = mutatingAction || readAction;
@@ -2268,6 +2385,19 @@ export default {
           const destroyed = await destroyContainer(env, url.origin, userId);
           return json({ ok: true, cleared, clearError, destroyed });
         }
+        if (action === 'purge') {
+          return json({
+            ok: true,
+            cleared: await clear(
+              env,
+              url.origin,
+              userId,
+              sessionId,
+              agent,
+              model
+            ),
+          });
+        }
         if (action === 'destroy')
           return json({
             ok: true,
@@ -2297,7 +2427,8 @@ export default {
             url.searchParams.get('retainPrevious') !== '0',
             maxBytes,
             archiveRetentionDays(url),
-            archiveMaxSnapshots(url)
+            archiveMaxSnapshots(url),
+            url.searchParams.get('deferCleanup') === '1'
           );
         }
         if (action === 'restore')

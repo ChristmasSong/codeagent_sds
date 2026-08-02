@@ -34,6 +34,20 @@ class RecordingHandler:
         pass
 
 
+class BoundedReadStream(io.BytesIO):
+    def __init__(self, data: bytes, max_read_size: int, per_read_limit=None):
+        super().__init__(data)
+        self.max_read_size = max_read_size
+        self.per_read_limit = per_read_limit or max_read_size
+        self.read_sizes = []
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        if size < 0 or size > self.max_read_size:
+            raise AssertionError(f"unbounded archive read requested: {size}")
+        return super().read(min(size, self.per_read_limit))
+
+
 class AgentCredentialTests(unittest.TestCase):
     def test_session_gateway_token_reaches_both_agent_environments(self):
         fixture_credential = "test-only-session-gateway-credential"
@@ -297,6 +311,128 @@ class WorkspaceArchiveTests(unittest.TestCase):
         self.assertEqual((self.root / "new.txt").read_bytes(), b"new\n")
         self.assertEqual(restored["digest"], expected["digest"])
 
+    def test_restore_accepts_seekable_file_without_unbounded_reads(self):
+        self.write("old.txt", b"old\n")
+        chunk_bytes = 16 * 1024
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            content = os.urandom(chunk_bytes + 7)
+            info = tarfile.TarInfo("streamed.txt")
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+        data = archive.getvalue()
+        source = BoundedReadStream(data, chunk_bytes)
+
+        with mock.patch.object(server, "ARCHIVE_IO_CHUNK_BYTES", chunk_bytes):
+            restored = server.restore_archive(
+                self.session_id,
+                source,
+                expected_archive_sha256=server.sha256_bytes(data),
+                archive_format=server.ARCHIVE_FORMAT,
+            )
+
+        self.assertEqual((self.root / "streamed.txt").read_bytes(), content)
+        self.assertEqual(restored["archive_sha256"], server.sha256_bytes(data))
+        self.assertGreater(len(source.read_sizes), 1)
+        self.assertTrue(
+            all(0 <= size <= chunk_bytes for size in source.read_sizes)
+        )
+
+    def test_restore_accepts_archive_path(self):
+        self.write("old.txt", b"old\n")
+        archive_path = Path(self.temp_dir.name) / "restore.tar.gz"
+        with tarfile.open(archive_path, mode="w:gz") as tar:
+            content = b"restored from path\n"
+            info = tarfile.TarInfo("path.txt")
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+        with archive_path.open("rb") as archive_file:
+            expected_archive_sha256 = server.archive_file_sha256(archive_file)
+
+        restored = server.restore_archive(
+            self.session_id,
+            archive_path,
+            expected_archive_sha256=expected_archive_sha256,
+            archive_format=server.ARCHIVE_FORMAT,
+        )
+
+        self.assertEqual((self.root / "path.txt").read_bytes(), content)
+        self.assertEqual(restored["file_count"], 1)
+
+    def test_restore_route_spools_request_body_in_bounded_chunks(self):
+        self.write("old.txt", b"old\n")
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            content = b"request body restore\n" * 1024
+            info = tarfile.TarInfo("request.txt")
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+        data = archive.getvalue()
+        source = BoundedReadStream(data, 31, per_read_limit=7)
+        handler = RecordingHandler()
+        handler.path = f"/restore/{self.session_id}"
+        handler.headers = {
+            "content-length": str(len(data)),
+            "x-expected-archive-sha256": server.sha256_bytes(data),
+            "x-archive-format": server.ARCHIVE_FORMAT,
+        }
+        handler.rfile = source
+
+        with mock.patch.object(server, "ARCHIVE_IO_CHUNK_BYTES", 31), mock.patch.object(
+            server, "tmux_exists", return_value=False
+        ):
+            server.Handler.do_PUT(handler)
+
+        self.assertEqual(handler.status, 200)
+        self.assertEqual((self.root / "request.txt").read_bytes(), content)
+        self.assertGreater(len(source.read_sizes), 1)
+        self.assertTrue(all(0 <= size <= 31 for size in source.read_sizes))
+
+    def test_restore_route_rejects_incomplete_request_without_replacing_workspace(
+        self,
+    ):
+        self.write("old.txt", b"keep me\n")
+        handler = RecordingHandler()
+        handler.path = f"/restore/{self.session_id}"
+        handler.headers = {"content-length": "10"}
+        handler.rfile = io.BytesIO(b"short")
+
+        with mock.patch.object(server, "tmux_exists", return_value=False):
+            server.Handler.do_PUT(handler)
+
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertEqual(handler.status, 400)
+        self.assertEqual(payload["code"], "restore_incomplete")
+        self.assertEqual((self.root / "old.txt").read_bytes(), b"keep me\n")
+
+    def test_archive_restore_and_clear_share_workspace_operation_lock(self):
+        self.write("old.txt", b"keep me\n")
+        archive_handler = RecordingHandler()
+        archive_handler.path = f"/archive/{self.session_id}"
+        archive_handler.headers = {}
+        restore_body = mock.Mock()
+        restore_handler = RecordingHandler()
+        restore_handler.path = f"/restore/{self.session_id}"
+        restore_handler.headers = {"content-length": "1"}
+        restore_handler.rfile = restore_body
+        clear_handler = RecordingHandler()
+        clear_handler.path = f"/clear/{self.session_id}"
+        clear_handler.headers = {}
+
+        with server.workspace_file_transfer(self.session_id, "upload.lock"):
+            server.Handler.do_GET(archive_handler)
+            server.Handler.do_PUT(restore_handler)
+            with mock.patch.object(server, "kill_tmux") as kill_tmux:
+                server.Handler.do_POST(clear_handler)
+
+        for handler in [archive_handler, restore_handler, clear_handler]:
+            payload = json.loads(handler.wfile.getvalue())
+            self.assertEqual(handler.status, 429)
+            self.assertEqual(payload["code"], "workspace_transfer_busy")
+        restore_body.read.assert_not_called()
+        kill_tmux.assert_not_called()
+        self.assertEqual((self.root / "old.txt").read_bytes(), b"keep me\n")
+
     def test_digest_failure_preserves_existing_workspace(self):
         self.write("old.txt", b"keep me\n")
         data, _manifest = self.build_archive()
@@ -310,7 +446,40 @@ class WorkspaceArchiveTests(unittest.TestCase):
                 server.ARCHIVE_FORMAT,
             )
 
+        self.assertEqual(raised.exception.code, "workspace_digest_mismatch")
         self.assertEqual(raised.exception.stage, "restore.verify")
+        self.assertEqual((self.root / "old.txt").read_bytes(), b"keep me\n")
+
+    def test_checksum_failure_preserves_existing_workspace(self):
+        self.write("old.txt", b"keep me\n")
+        data, _manifest = self.build_archive()
+
+        with self.assertRaises(server.RuntimeOperationError) as raised:
+            server.restore_archive(
+                self.session_id,
+                io.BytesIO(data),
+                expected_archive_sha256="0" * 64,
+                archive_format=server.ARCHIVE_FORMAT,
+            )
+
+        self.assertEqual(raised.exception.code, "archive_checksum_mismatch")
+        self.assertEqual(raised.exception.stage, "restore.validate")
+        self.assertEqual((self.root / "old.txt").read_bytes(), b"keep me\n")
+
+    def test_corrupt_archive_preserves_existing_workspace(self):
+        self.write("old.txt", b"keep me\n")
+        data = b"not a gzip archive"
+
+        with self.assertRaises(server.RuntimeOperationError) as raised:
+            server.restore_archive(
+                self.session_id,
+                io.BytesIO(data),
+                expected_archive_sha256=server.sha256_bytes(data),
+                archive_format=server.ARCHIVE_FORMAT,
+            )
+
+        self.assertEqual(raised.exception.code, "archive_extract_failed")
+        self.assertEqual(raised.exception.stage, "restore.extract")
         self.assertEqual((self.root / "old.txt").read_bytes(), b"keep me\n")
 
     def test_unsafe_archive_preserves_existing_workspace(self):
@@ -333,6 +502,29 @@ class WorkspaceArchiveTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "unsafe_archive_path")
         self.assertEqual((self.root / "old.txt").read_bytes(), b"keep me\n")
         self.assertFalse((server.ROOT.parent / "escape.txt").exists())
+
+    def test_unsupported_archive_entry_preserves_existing_workspace(self):
+        self.write("old.txt", b"keep me\n")
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            link = tarfile.TarInfo("workspace-link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "old.txt"
+            tar.addfile(link)
+        data = archive.getvalue()
+
+        with self.assertRaises(server.RuntimeOperationError) as raised:
+            server.restore_archive(
+                self.session_id,
+                io.BytesIO(data),
+                expected_archive_sha256=server.sha256_bytes(data),
+                archive_format=server.ARCHIVE_FORMAT,
+            )
+
+        self.assertEqual(raised.exception.code, "unsupported_archive_entry")
+        self.assertEqual(raised.exception.stage, "restore.validate")
+        self.assertEqual((self.root / "old.txt").read_bytes(), b"keep me\n")
+        self.assertFalse((self.root / "workspace-link").exists())
 
 
 class WorkspaceFilesTest(unittest.TestCase):

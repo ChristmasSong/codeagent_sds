@@ -3,6 +3,7 @@ import { and, eq, sql } from 'drizzle-orm';
 
 import { db } from '@/core/db';
 import {
+  codeBillingEvent,
   codeSession,
   storageObject,
   storageReservation,
@@ -15,6 +16,9 @@ import {
   deleteSessionPermanently,
   discardSession,
   getOwnedSession,
+  preflightSessionResume,
+  resumeArchivedSession,
+  toView,
 } from './service';
 import {
   acquireStorageMutationLock,
@@ -29,6 +33,41 @@ const partialFailures = new Map<
 >();
 const requests: Array<{ action: string; sessionId: string }> = [];
 const originalFetch = globalThis.fetch;
+const billingFailureTrigger = 'fail_permanent_delete_billing';
+const auditFailureTrigger = 'fail_permanent_delete_audit';
+
+function requestsFor(sessionId: string, ...actions: string[]) {
+  return requests.filter(
+    (request) =>
+      request.sessionId === sessionId && actions.includes(request.action)
+  );
+}
+
+function errorChainText(error: unknown) {
+  const messages: string[] = [];
+  let current = error;
+  for (let depth = 0; current && depth < 8; depth += 1) {
+    if (current instanceof Error) messages.push(current.message);
+    current =
+      typeof current === 'object' && current && 'cause' in current
+        ? (current as { cause?: unknown }).cause
+        : null;
+  }
+  return messages.join('\n');
+}
+
+async function runtimeBillingEventCount(sessionId: string) {
+  const rows = (await db()
+    .select({ id: codeBillingEvent.id })
+    .from(codeBillingEvent)
+    .where(
+      and(
+        eq(codeBillingEvent.sessionId, sessionId),
+        eq(codeBillingEvent.eventType, 'runtime_minutes')
+      )
+    )) as Array<{ id: string }>;
+  return rows.length;
+}
 
 function ids(label: string) {
   return {
@@ -114,6 +153,9 @@ globalThis.fetch = async (input, init) => {
 
   if (action === 'destroy') {
     return Response.json({ ok: true, destroyed: true });
+  }
+  if (action === 'purge') {
+    return Response.json({ ok: true, cleared: true });
   }
   if (action === 'archive-delete') {
     const partial = partialFailures.get(sessionId);
@@ -219,18 +261,33 @@ try {
     archived.userId,
     archived.sessionId
   );
-  assert.equal(archivedResult.runtime.attempted, false);
+  assert.equal(archivedResult.runtime.attempted, true);
   assert.equal(
-    archivedResult.runtime.skippedReason,
-    'session_not_active',
-    'archived deletion must not destroy the current user Runtime container'
+    archivedResult.runtime.action,
+    'destroy',
+    'a suspended session must clean up any Runtime container left behind'
   );
   assert.equal(
-    requests.some(
-      (request) =>
-        request.action === 'destroy' && request.sessionId === archived.sessionId
-    ),
-    false
+    requestsFor(archived.sessionId, 'destroy').length,
+    1,
+    'a suspended session must attempt Runtime cleanup exactly once'
+  );
+
+  const ended = await seedCase({
+    label: 'ended',
+    status: 'ended',
+    bytes: 21,
+  });
+  const endedResult = await deleteSessionPermanently(
+    ended.userId,
+    ended.sessionId
+  );
+  assert.equal(endedResult.runtime.attempted, true);
+  assert.equal(endedResult.runtime.action, 'destroy');
+  assert.equal(
+    requestsFor(ended.sessionId, 'destroy').length,
+    1,
+    'an ended session must also clean up any Runtime container left behind'
   );
 
   const concurrent = await seedCase({
@@ -264,27 +321,99 @@ try {
     .update(codeSession)
     .set({ runtimeUserId: sharedRuntime.runtimeUserId })
     .where(eq(codeSession.id, `${sharedRuntime.sessionId}-other`));
-  await assert.rejects(
-    deleteSessionPermanently(sharedRuntime.userId, sharedRuntime.sessionId),
-    /shared Runtime container cannot be deleted safely/
+  const sharedRuntimeResult = await deleteSessionPermanently(
+    sharedRuntime.userId,
+    sharedRuntime.sessionId
+  );
+  assert.equal(sharedRuntimeResult.deleted, true);
+  assert.equal(sharedRuntimeResult.runtime.action, 'purge');
+  assert.equal(
+    await getOwnedSession(sharedRuntime.userId, sharedRuntime.sessionId),
+    undefined,
+    'the target session must still be deleted after its workspace is purged'
   );
   assert.ok(
-    await getOwnedSession(sharedRuntime.userId, sharedRuntime.sessionId),
-    'the target session must be retained when Runtime deletion is unsafe'
+    await getOwnedSession(
+      sharedRuntime.userId,
+      `${sharedRuntime.sessionId}-other`
+    ),
+    'the other active session sharing the Runtime must remain intact'
   );
   assert.equal(
-    requests.some(
-      (request) =>
-        request.sessionId === sharedRuntime.sessionId &&
-        (request.action === 'destroy' || request.action === 'archive-delete')
-    ),
-    false,
-    'unsafe shared-Runtime deletion must fail before external mutation'
+    requestsFor(sharedRuntime.sessionId, 'purge').length,
+    1,
+    'shared Runtime deletion must purge only the target workspace'
+  );
+  assert.equal(
+    requestsFor(sharedRuntime.sessionId, 'destroy').length,
+    0,
+    'the shared Runtime container itself must not be destroyed'
+  );
+
+  const billingFailure = await seedCase({
+    label: 'billing-failure',
+    status: 'active',
+    bytes: 35,
+  });
+  await db()
+    .update(codeSession)
+    .set({
+      createdAt: new Date(Date.now() - 24 * 60 * 60_000),
+      lastBilledAt: new Date(Date.now() - 10 * 60_000),
+    })
+    .where(eq(codeSession.id, billingFailure.sessionId));
+  await db().run(sql.raw(`drop trigger if exists ${billingFailureTrigger}`));
+  await db().run(
+    sql.raw(`
+      create trigger ${billingFailureTrigger}
+      before insert on code_billing_event
+      when new.session_id = '${billingFailure.sessionId}'
+        and new.event_type = 'runtime_minutes'
+      begin
+        select raise(fail, 'simulated final billing failure');
+      end
+    `)
+  );
+  const requestsBeforeBillingFailure = requests.length;
+  await assert.rejects(
+    deleteSessionPermanently(billingFailure.userId, billingFailure.sessionId),
+    (error) => {
+      assert.match(errorChainText(error), /simulated final billing failure/);
+      return true;
+    }
+  );
+  await db().run(sql.raw(`drop trigger if exists ${billingFailureTrigger}`));
+  assert.deepEqual(
+    requests.slice(requestsBeforeBillingFailure),
+    [],
+    'billing failure must happen before Runtime cleanup or R2 deletion'
+  );
+  const billingPendingSession = await getOwnedSession(
+    billingFailure.userId,
+    billingFailure.sessionId
+  );
+  assert.ok(billingPendingSession, 'billing failure must retain the session');
+  assert.equal(billingPendingSession.status, 'ended');
+  assert.match(billingPendingSession.suspensionReason, /^delete_pending:/);
+  assert.equal(toView(billingPendingSession).deletionPending, true);
+  const requestsBeforePendingResume = requests.length;
+  await assert.rejects(
+    preflightSessionResume(billingFailure.userId, billingFailure.sessionId),
+    /pending.*deletion|deletion.*pending/i
+  );
+  await assert.rejects(
+    resumeArchivedSession(billingFailure.userId, billingFailure.sessionId),
+    /pending.*deletion|deletion.*pending/i
+  );
+  assert.equal(
+    requests.length,
+    requestsBeforePendingResume,
+    'a deletion-pending session must be rejected before Runtime restore'
   );
 
   const retryable = await seedCase({
     label: 'retryable',
-    status: 'ended',
+    status: 'active',
     bytes: 40,
   });
   failedSessionIds.add(retryable.sessionId);
@@ -292,9 +421,30 @@ try {
     deleteSessionPermanently(retryable.userId, retryable.sessionId),
     /could not be deleted/
   );
+  const retryablePendingSession = await getOwnedSession(
+    retryable.userId,
+    retryable.sessionId
+  );
   assert.ok(
-    await getOwnedSession(retryable.userId, retryable.sessionId),
+    retryablePendingSession,
     'an R2 failure must retain the session for retry'
+  );
+  assert.equal(retryablePendingSession.status, 'ended');
+  assert.match(retryablePendingSession.suspensionReason, /^delete_pending:/);
+  assert.equal(
+    toView(retryablePendingSession).deletionPending,
+    true,
+    'a failed permanent deletion must remain visibly retryable'
+  );
+  assert.equal(
+    requestsFor(retryable.sessionId, 'destroy', 'purge').length,
+    1,
+    'Runtime cleanup must finish before the injected R2 failure'
+  );
+  assert.equal(
+    await runtimeBillingEventCount(retryable.sessionId),
+    1,
+    'the first active deletion attempt must durably record final billing'
   );
   const [retryableObject, retryableUsage] = await Promise.all([
     db()
@@ -319,6 +469,14 @@ try {
   assert.equal(Number(retryableUsage?.usedBytes), 40);
   assert.equal(Number(retryableUsage?.pendingDeleteBytes), 0);
 
+  const runtimeCleanupCountBeforeRetry = requestsFor(
+    retryable.sessionId,
+    'destroy',
+    'purge'
+  ).length;
+  const billingEventCountBeforeRetry = await runtimeBillingEventCount(
+    retryable.sessionId
+  );
   failedSessionIds.delete(retryable.sessionId);
   const retried = await deleteSessionPermanently(
     retryable.userId,
@@ -328,6 +486,16 @@ try {
   assert.equal(
     await getOwnedSession(retryable.userId, retryable.sessionId),
     undefined
+  );
+  assert.equal(
+    requestsFor(retryable.sessionId, 'destroy', 'purge').length,
+    runtimeCleanupCountBeforeRetry,
+    'retrying after an R2 failure must not repeat successful Runtime cleanup'
+  );
+  assert.equal(
+    await runtimeBillingEventCount(retryable.sessionId),
+    billingEventCountBeforeRetry,
+    'retrying after an R2 failure must not create another final billing event'
   );
 
   const locked = await seedCase({
@@ -394,17 +562,20 @@ try {
       .limit(1)
       .then((rows: Array<typeof storageUsage.$inferSelect>) => rows[0]),
   ]);
+  const typedPartialRows = partialRows as Array<
+    typeof storageObject.$inferSelect
+  >;
   assert.equal(
     partialSession?.archiveKey,
     null,
     'a physically deleted current archive must not remain as the restore pointer'
   );
   assert.equal(
-    partialRows.find((row) => row.key === partial.key)?.status,
+    typedPartialRows.find((row) => row.key === partial.key)?.status,
     'deleted'
   );
   assert.equal(
-    partialRows.find((row) => row.key === partialSnapshotKey)?.status,
+    typedPartialRows.find((row) => row.key === partialSnapshotKey)?.status,
     'active'
   );
   assert.equal(Number(partialUsage?.usedBytes), 15);
@@ -526,9 +697,10 @@ try {
     status: 'ended',
     bytes: 70,
   });
+  await db().run(sql.raw(`drop trigger if exists ${auditFailureTrigger}`));
   await db().run(
     sql.raw(`
-      create trigger fail_permanent_delete_audit
+      create trigger ${auditFailureTrigger}
       before insert on code_session_event
       when new.event_type = 'session.deleted_permanently'
       begin
@@ -549,8 +721,15 @@ try {
     await getOwnedSession(auditFailure.userId, auditFailure.sessionId),
     undefined
   );
+  await db().run(sql.raw(`drop trigger if exists ${auditFailureTrigger}`));
 
   console.info('code session permanent deletion integration tests passed');
 } finally {
+  try {
+    await db().run(sql.raw(`drop trigger if exists ${billingFailureTrigger}`));
+    await db().run(sql.raw(`drop trigger if exists ${auditFailureTrigger}`));
+  } catch {
+    // Best-effort test cleanup; the primary failure should remain visible.
+  }
   globalThis.fetch = originalFetch;
 }

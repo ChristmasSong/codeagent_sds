@@ -1,9 +1,10 @@
 import { and, eq, inArray } from 'drizzle-orm';
 
 import { db } from '@/core/db';
-import { codeSession } from '@/config/db/schema';
+import { codeSession, storageObject } from '@/config/db/schema';
 import type { StorageObjectSummary } from '@/lib/storage-contract';
 
+import { acquireArchiveLock, releaseArchiveLock } from './service';
 import {
   acquireStorageMutationLock,
   markStorageObjectsDeleting,
@@ -138,8 +139,75 @@ export async function cleanupStorage(input: {
   objectId?: string;
   sessionId?: string;
 }) {
-  const lockToken = await acquireStorageMutationLock(input.userId);
+  let sessionId = input.sessionId || '';
+  let objectKey = '';
+  if (input.scope === 'object' && input.objectId) {
+    const [object] = await db()
+      .select({
+        sessionId: storageObject.sessionId,
+        key: storageObject.key,
+      })
+      .from(storageObject)
+      .where(
+        and(
+          eq(storageObject.userId, input.userId),
+          eq(storageObject.id, input.objectId)
+        )
+      )
+      .limit(1);
+    if (sessionId && object?.sessionId && object.sessionId !== sessionId) {
+      throw new Error('Storage object does not belong to the session');
+    }
+    sessionId = object?.sessionId || sessionId;
+    objectKey = object?.key || '';
+    if (!sessionId) throw new Error('Storage object not found');
+  }
+
+  const [session] = sessionId
+    ? await db()
+        .select()
+        .from(codeSession)
+        .where(
+          and(
+            eq(codeSession.userId, input.userId),
+            eq(codeSession.id, sessionId)
+          )
+        )
+        .limit(1)
+    : [];
+  if (sessionId && !session) throw new Error('Session not found');
+  const archiveLockToken = session ? await acquireArchiveLock(session) : '';
+  let lockToken = '';
   try {
+    // Lifecycle operations use archive -> storage lock order. Match that order
+    // here so cleanup cannot delete an archive during restore or resume.
+    lockToken = await acquireStorageMutationLock(input.userId);
+    if (session) {
+      const [lockedSession] = await db()
+        .select()
+        .from(codeSession)
+        .where(
+          and(
+            eq(codeSession.userId, input.userId),
+            eq(codeSession.id, session.id),
+            eq(codeSession.archiveLockToken, archiveLockToken)
+          )
+        )
+        .limit(1);
+      if (!lockedSession) {
+        throw new Error('Session changed before storage cleanup could start');
+      }
+      const removesCurrentArchive =
+        input.scope === 'session' ||
+        (input.scope === 'object' &&
+          Boolean(objectKey) &&
+          objectKey === lockedSession.archiveKey);
+      if (lockedSession.status === 'active' && removesCurrentArchive) {
+        throw new Error(
+          'The current archive of an active session cannot be deleted'
+        );
+      }
+    }
     const pending = await markStorageObjectsDeleting({
       ...input,
       lockToken,
@@ -149,8 +217,15 @@ export async function cleanupStorage(input: {
       cleanup: await executeStorageCleanup(input.userId, pending, lockToken),
     };
   } finally {
-    await releaseStorageMutationLock(input.userId, lockToken).catch(
-      () => undefined
-    );
+    if (lockToken) {
+      await releaseStorageMutationLock(input.userId, lockToken).catch(
+        () => undefined
+      );
+    }
+    if (session && archiveLockToken) {
+      await releaseArchiveLock(session, archiveLockToken).catch(
+        () => undefined
+      );
+    }
   }
 }

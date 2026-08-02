@@ -54,7 +54,10 @@ import { ApiError, apiGet, apiPost } from '@/lib/api-client';
 import type { WorkspaceFileEntry } from '@/lib/code-files';
 import { cn } from '@/lib/utils';
 import { SandboxFilePreview } from '@/components/code-workspace/sandbox-file-preview';
-import { SandboxFileTree } from '@/components/code-workspace/sandbox-file-tree';
+import {
+  SandboxFileTree,
+  type SandboxFileTreeHandle,
+} from '@/components/code-workspace/sandbox-file-tree';
 import { Button, buttonVariants } from '@/components/ui/button';
 import {
   Dialog,
@@ -219,6 +222,8 @@ function CodeWorkspacePage() {
   const [selectedFile, setSelectedFile] = useState<WorkspaceFileEntry | null>(
     null
   );
+  const [fileTransferBusy, setFileTransferBusy] = useState(false);
+  const sandboxFileTreeRef = useRef<SandboxFileTreeHandle | null>(null);
   const workbenchRef = useRef<HTMLDivElement | null>(null);
   const workspaceFilesRef = useRef<HTMLDivElement | null>(null);
   const sidebarTransitionTimerRef = useRef<number | null>(null);
@@ -286,7 +291,17 @@ function CodeWorkspacePage() {
   const canCreateSession = Boolean(selectedModel && availableModels.length);
   const hasSession = Boolean(sessionId);
   const controlsDisabled =
-    !hasSession || Boolean(busyAction) || restoreInProgress;
+    !hasSession || Boolean(busyAction) || restoreInProgress || fileTransferBusy;
+  const cancelFileUpload = useCallback(() => {
+    sandboxFileTreeRef.current?.cancelUpload();
+  }, []);
+  const changeSession = useCallback(
+    (nextSessionId: string | null) => {
+      cancelFileUpload();
+      setSessionId(nextSessionId);
+    },
+    [cancelFileUpload]
+  );
   const markSessionRestoreReady = useCallback((id: string) => {
     setRestoredSessionIds((prev) =>
       prev[id] ? prev : { ...prev, [id]: true }
@@ -627,7 +642,14 @@ function CodeWorkspacePage() {
   }, [sessionId, status]);
 
   useEffect(() => {
-    if (!terminalSessionId || status !== 'connected' || busyAction) return;
+    if (
+      !terminalSessionId ||
+      status !== 'connected' ||
+      busyAction ||
+      fileTransferBusy
+    ) {
+      return;
+    }
     let cancelled = false;
     const timer = window.setInterval(() => {
       markArchiveSaving(terminalSessionId);
@@ -648,6 +670,7 @@ function CodeWorkspacePage() {
     };
   }, [
     busyAction,
+    fileTransferBusy,
     markArchiveError,
     markArchiveSaved,
     markArchiveSaving,
@@ -693,6 +716,7 @@ function CodeWorkspacePage() {
       revealSidebarFeedback();
       return;
     }
+    cancelFileUpload();
     setBusyAction('new');
     setNewSessionIssue(null);
     setNewSessionMsg(m['code.actions.running']());
@@ -725,7 +749,7 @@ function CodeWorkspacePage() {
         model: selectedModel,
       });
       setSessions([session]);
-      setSessionId(session.id);
+      changeSession(session.id);
       setArchiveCheckpoint(checkpointFromSession(session));
       markSessionRestoreReady(session.id);
       setSelectedAgent(session.agent);
@@ -762,6 +786,7 @@ function CodeWorkspacePage() {
   };
 
   const requestRestoreArchivedSession = (session: CodeSessionView) => {
+    if (session.deletionPending) return;
     setConfirmRestoreSession(session);
   };
 
@@ -772,6 +797,7 @@ function CodeWorkspacePage() {
 
   const permanentlyDeleteSession = async (session: CodeSessionView) => {
     const deletingId = session.id;
+    cancelFileUpload();
     setBusyAction('delete-permanently');
     setActionMsg(m['code.actions.running']());
     try {
@@ -783,7 +809,7 @@ function CodeWorkspacePage() {
         prev.filter((item) => item.id !== deletingId)
       );
       if (sessionId === deletingId) {
-        setSessionId(null);
+        changeSession(null);
         setArchiveCheckpoint(checkpointFromSession(null));
       }
       setConfirmPermanentDeleteSession(null);
@@ -792,6 +818,22 @@ function CodeWorkspacePage() {
       toast.success(m['code.actions.deleted_permanently']());
     } catch (err) {
       const message = (err as Error).message || 'error';
+      try {
+        const [nextSessions, nextArchivedSessions] = await Promise.all([
+          apiGet<CodeSessionView[]>('/api/code/sessions'),
+          apiGet<CodeSessionView[]>('/api/code/sessions?status=archived'),
+        ]);
+        setSessions(nextSessions);
+        setArchivedSessions(nextArchivedSessions);
+        if (
+          sessionId === deletingId &&
+          !nextSessions.some((item) => item.id === deletingId)
+        ) {
+          changeSession(nextSessions[0]?.id || null);
+        }
+      } catch {
+        // Preserve the deletion error when refreshing the retryable state fails.
+      }
       setActionMsg(message);
       toast.error(message);
     } finally {
@@ -802,13 +844,14 @@ function CodeWorkspacePage() {
   const endCurrentSession = async () => {
     if (!sessionId) return;
     const endingId = sessionId;
+    cancelFileUpload();
     setBusyAction('end');
     setActionMsg(m['code.actions.running']());
     try {
       const payload = await runSessionAction(endingId, 'end');
       rememberArchivedSession(payload.session);
       setSessions((prev) => prev.filter((session) => session.id !== endingId));
-      setSessionId(null);
+      changeSession(null);
       setActionMsg(formatActionMessage('end', payload));
     } catch (err) {
       setActionMsg((err as Error).message || 'error');
@@ -818,6 +861,7 @@ function CodeWorkspacePage() {
   };
 
   const restoreArchivedSession = async (archivedSessionId: string) => {
+    cancelFileUpload();
     setBusyAction('resume');
     setNewSessionIssue(null);
     setNewSessionMsg(m['code.actions.running']());
@@ -831,27 +875,19 @@ function CodeWorkspacePage() {
         setSessions((prev) =>
           prev.filter((session) => session.id !== sessionId)
         );
-        setSessionId(null);
+        changeSession(null);
       }
 
       const payload = await runSessionAction(archivedSessionId, 'resume');
       if (!payload.session) throw new Error('Restore failed');
-      const resumedSession = payload.session;
-      markSessionRestorePending(resumedSession.id);
-      setRestoreGate({
-        sessionId: resumedSession.id,
-        status: 'restoring',
-        message: m['code.actions.restoring'](),
-      });
-      const restorePayload = await restoreSessionBeforeConnect(
-        resumedSession.id
-      );
-      const session = restorePayload.session || resumedSession;
+      const session = payload.session;
+      markSessionRestoreReady(session.id);
+      markRestoreIntegrity(session.id, payload);
       setArchivedSessions((prev) =>
         prev.filter((item) => item.id !== session.id)
       );
       setSessions([session]);
-      setSessionId(session.id);
+      changeSession(session.id);
       setArchiveCheckpoint(checkpointFromSession(session));
       setSelectedAgent(session.agent);
       setSelectedModel(session.model);
@@ -862,7 +898,7 @@ function CodeWorkspacePage() {
         `${m['code.actions.restoring']()}: ${shortId(session.id)}`
       );
       setRestoreGate({ sessionId: session.id, status: 'ready', message: '' });
-      setActionMsg(formatActionMessage('restore', restorePayload));
+      setActionMsg(formatActionMessage('restore', payload));
     } catch (err) {
       const issue = sessionStartIssueFromError(err);
       const message = issue ? '' : (err as Error).message || 'error';
@@ -876,6 +912,9 @@ function CodeWorkspacePage() {
 
   const runAction = async (action: CodeAction) => {
     if (!sessionId) return;
+    if (action === 'archive' || action === 'restore' || action === 'suspend') {
+      cancelFileUpload();
+    }
     setBusyAction(action);
     setActionMsg(m['code.actions.running']());
     if (action === 'archive') {
@@ -888,7 +927,7 @@ function CodeWorkspacePage() {
         setSessions((prev) =>
           prev.filter((session) => session.id !== sessionId)
         );
-        setSessionId(null);
+        changeSession(null);
       } else if (payload.session) {
         setSessions((prev) => upsertSession(prev, payload.session!));
       }
@@ -1290,6 +1329,7 @@ function CodeWorkspacePage() {
                   disabled={
                     Boolean(busyAction) ||
                     restoreInProgress ||
+                    fileTransferBusy ||
                     !canCreateSession
                   }
                   onClick={requestNewSession}
@@ -1420,7 +1460,7 @@ function CodeWorkspacePage() {
                     session.id === sessionId ? 'bg-muted' : 'hover:bg-muted/70'
                   )}
                   onClick={() => {
-                    setSessionId(session.id);
+                    if (session.id !== sessionId) changeSession(session.id);
                     setSelectedAgent(session.agent);
                     setSelectedModel(session.model);
                     setActiveWorkbenchPane('terminal');
@@ -1474,7 +1514,12 @@ function CodeWorkspacePage() {
                     <button
                       type="button"
                       className="flex min-w-0 flex-1 items-center gap-3 rounded-md px-3 py-2 text-left text-sm disabled:cursor-not-allowed disabled:opacity-60"
-                      disabled={Boolean(busyAction) || restoreInProgress}
+                      disabled={
+                        Boolean(busyAction) ||
+                        restoreInProgress ||
+                        fileTransferBusy ||
+                        session.deletionPending
+                      }
                       title={m['code.actions.restore_description']()}
                       onClick={() => requestRestoreArchivedSession(session)}
                     >
@@ -1501,7 +1546,11 @@ function CodeWorkspacePage() {
                       size="icon"
                       variant="ghost"
                       className="text-destructive hover:text-destructive size-7 shrink-0"
-                      disabled={Boolean(busyAction) || restoreInProgress}
+                      disabled={
+                        Boolean(busyAction) ||
+                        restoreInProgress ||
+                        fileTransferBusy
+                      }
                       aria-label={m['code.actions.delete_permanently']()}
                       title={m['code.actions.delete_permanently_description']()}
                       onClick={() => requestPermanentDeleteSession(session)}
@@ -1636,7 +1685,8 @@ function CodeWorkspacePage() {
                     disabled={
                       !terminalSessionId ||
                       Boolean(busyAction) ||
-                      restoreInProgress
+                      restoreInProgress ||
+                      fileTransferBusy
                     }
                     onClick={() => void reconnectTerminal()}
                   >
@@ -1804,11 +1854,13 @@ function CodeWorkspacePage() {
                   </div>
                   <div className="min-h-0 flex-1 overflow-hidden p-3">
                     <SandboxFileTree
+                      ref={sandboxFileTreeRef}
                       sessionId={sessionId}
                       sessionStatus={currentSession?.status}
                       visible={filesPanelVisible}
                       selectedPath={selectedFile?.path}
                       onFileSelect={setSelectedFile}
+                      onTransferBusyChange={setFileTransferBusy}
                       labels={{
                         refresh: m['code.files.refresh'](),
                         loading: m['code.files.loading'](),
@@ -2163,7 +2215,8 @@ function CodeWorkspacePage() {
               disabled={
                 !currentSession ||
                 discardConfirmation !== currentSession.id ||
-                Boolean(busyAction)
+                Boolean(busyAction) ||
+                fileTransferBusy
               }
               onClick={() => {
                 setConfirmNewSessionOpen(false);
@@ -2175,6 +2228,7 @@ function CodeWorkspacePage() {
             </Button>
             <Button
               type="button"
+              disabled={Boolean(busyAction) || fileTransferBusy}
               onClick={() => {
                 setConfirmNewSessionOpen(false);
                 void newSession('suspend');
@@ -2216,6 +2270,9 @@ function CodeWorkspacePage() {
             </Button>
             <Button
               type="button"
+              disabled={
+                Boolean(busyAction) || restoreInProgress || fileTransferBusy
+              }
               onClick={() => {
                 const session = confirmRestoreSession;
                 setConfirmRestoreSession(null);
@@ -2258,7 +2315,9 @@ function CodeWorkspacePage() {
             <Button
               type="button"
               variant="destructive"
-              disabled={Boolean(busyAction) || !currentSession}
+              disabled={
+                Boolean(busyAction) || !currentSession || fileTransferBusy
+              }
               onClick={() => {
                 setConfirmEndSessionOpen(false);
                 void endCurrentSession();
@@ -2335,7 +2394,8 @@ function CodeWorkspacePage() {
                 !confirmPermanentDeleteSession ||
                 permanentDeleteConfirmation !==
                   confirmPermanentDeleteSession.id ||
-                Boolean(busyAction)
+                Boolean(busyAction) ||
+                fileTransferBusy
               }
               onClick={() => {
                 const session = confirmPermanentDeleteSession;
@@ -2377,8 +2437,9 @@ function upsertArchivedSession(
 ) {
   const rest = sessions.filter((item) => item.id !== session.id);
   if (
-    (session.status !== 'ended' && session.status !== 'suspended') ||
-    !session.archiveKey
+    !session.deletionPending &&
+    ((session.status !== 'ended' && session.status !== 'suspended') ||
+      !session.archiveKey)
   ) {
     return rest;
   }

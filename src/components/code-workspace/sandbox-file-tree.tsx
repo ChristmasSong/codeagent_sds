@@ -1,5 +1,8 @@
 import {
+  forwardRef,
+  useCallback,
   useEffect,
+  useImperativeHandle,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
@@ -63,7 +66,12 @@ interface SandboxFileTreeProps {
   visible?: boolean;
   selectedPath?: string;
   onFileSelect?: (entry: WorkspaceFileEntry) => void;
+  onTransferBusyChange?: (busy: boolean) => void;
   labels: SandboxFileTreeLabels;
+}
+
+export interface SandboxFileTreeHandle {
+  cancelUpload: () => void;
 }
 
 type UploadQueueStatus = 'pending' | 'uploading' | 'success' | 'error';
@@ -75,14 +83,21 @@ interface UploadQueueEntry {
   error?: string;
 }
 
-export function SandboxFileTree({
-  sessionId,
-  sessionStatus = 'active',
-  visible = true,
-  selectedPath = '',
-  onFileSelect,
-  labels,
-}: SandboxFileTreeProps) {
+export const SandboxFileTree = forwardRef<
+  SandboxFileTreeHandle,
+  SandboxFileTreeProps
+>(function SandboxFileTree(
+  {
+    sessionId,
+    sessionStatus = 'active',
+    visible = true,
+    selectedPath = '',
+    onFileSelect,
+    onTransferBusyChange,
+    labels,
+  },
+  ref
+) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
   const transferBatchRef = useRef(0);
@@ -106,16 +121,33 @@ export function SandboxFileTree({
   const transferBusy = isUploading || downloadAll.isPending;
   const canTransfer = canRead && !transferBusy;
 
-  useEffect(() => {
+  const cancelUpload = useCallback(() => {
     transferBatchRef.current += 1;
     uploadAbortRef.current?.abort();
     uploadAbortRef.current = null;
     dragDepthRef.current = 0;
     setUploadQueue([]);
     setUploadNotice('');
-    setDownloadError('');
     setIsDraggingFiles(false);
-  }, [sessionId]);
+  }, []);
+
+  useImperativeHandle(ref, () => ({ cancelUpload }), [cancelUpload]);
+
+  useEffect(() => {
+    onTransferBusyChange?.(transferBusy);
+  }, [onTransferBusyChange, transferBusy]);
+
+  useEffect(
+    () => () => {
+      onTransferBusyChange?.(false);
+    },
+    [onTransferBusyChange]
+  );
+
+  useEffect(() => {
+    cancelUpload();
+    setDownloadError('');
+  }, [cancelUpload, sessionId]);
 
   useEffect(
     () => () => {
@@ -446,7 +478,7 @@ export function SandboxFileTree({
       </div>
     </div>
   );
-}
+});
 
 function FileTreeEntry({
   entry,

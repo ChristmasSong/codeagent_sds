@@ -2496,6 +2496,65 @@ def archive_file_sha256(archive_file) -> str:
     return digest.hexdigest()
 
 
+def spool_restore_archive(source, content_length: int):
+    if not isinstance(content_length, int) or content_length < 0:
+        raise RuntimeOperationError(
+            "content_length_required",
+            "restore.request",
+            "A valid Content-Length header is required",
+            411,
+        )
+
+    archive_file = tempfile.TemporaryFile(mode="w+b")
+    digest = hashlib.sha256()
+    bytes_read = 0
+    try:
+        while bytes_read < content_length:
+            chunk = source.read(
+                min(ARCHIVE_IO_CHUNK_BYTES, content_length - bytes_read)
+            )
+            if not chunk:
+                raise RuntimeOperationError(
+                    "restore_incomplete",
+                    "restore.request",
+                    "The restore upload ended before Content-Length bytes arrived",
+                    400,
+                    {
+                        "expectedBytes": content_length,
+                        "actualBytes": bytes_read,
+                    },
+                )
+            written = archive_file.write(chunk)
+            if written != len(chunk):
+                raise OSError("failed to write restore archive data")
+            digest.update(chunk)
+            bytes_read += len(chunk)
+        archive_file.flush()
+        archive_file.seek(0)
+        return archive_file, digest.hexdigest()
+    except Exception:
+        archive_file.close()
+        raise
+
+
+@contextmanager
+def open_restore_archive(source):
+    if isinstance(source, (str, os.PathLike)):
+        with Path(source).open("rb") as archive_file:
+            yield archive_file
+        return
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        with io.BytesIO(source) as archive_file:
+            yield archive_file
+        return
+    if not callable(getattr(source, "read", None)) or not callable(
+        getattr(source, "seek", None)
+    ):
+        raise TypeError("restore archive must be a path or seekable binary file")
+    source.seek(0)
+    yield source
+
+
 def make_archive(session_id: str, max_bytes: Optional[int] = None):
     root = session_path(session_id)
     if not root.exists():
@@ -2585,117 +2644,128 @@ def safe_archive_member_path(member_name: str) -> PurePosixPath:
 
 def restore_archive(
     session_id: str,
-    data: bytes,
+    archive_source,
     expected_workspace_digest: str = "",
     expected_archive_sha256: str = "",
     archive_format: str = "1",
+    actual_archive_sha256: str = "",
 ):
     root = session_path(session_id)
     staging = ROOT / f".{safe_name(session_id)}.restore-{uuid.uuid4().hex}"
     backup = ROOT / f".{safe_name(session_id)}.backup-{uuid.uuid4().hex}"
 
-    actual_archive_sha256 = sha256_bytes(data)
-    if expected_archive_sha256 and actual_archive_sha256 != expected_archive_sha256:
-        raise RuntimeOperationError(
-            "archive_checksum_mismatch",
-            "restore.validate",
-            "Archive checksum does not match R2 metadata",
-            409,
-            {
-                "expectedArchiveSha256": expected_archive_sha256,
-                "actualArchiveSha256": actual_archive_sha256,
-            },
-        )
-
-    try:
-        staging.mkdir(parents=True, exist_ok=False)
-        try:
-            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-                for member in tar.getmembers():
-                    relative = safe_archive_member_path(member.name)
-                    if member.isdir():
-                        (staging.joinpath(*relative.parts)).mkdir(
-                            parents=True, exist_ok=True
-                        )
-                        continue
-                    if not member.isfile():
-                        raise RuntimeOperationError(
-                            "unsupported_archive_entry",
-                            "restore.validate",
-                            f"Unsupported archive entry: {member.name}",
-                            422,
-                            {
-                                "path": member.name,
-                                "type": member.type.decode(errors="ignore"),
-                            },
-                        )
-                    source = tar.extractfile(member)
-                    if source is None:
-                        raise RuntimeOperationError(
-                            "archive_entry_unreadable",
-                            "restore.extract",
-                            f"Archive entry cannot be read: {member.name}",
-                            422,
-                            {"path": member.name},
-                        )
-                    target = staging.joinpath(*relative.parts)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with source, target.open("wb") as output:
-                        shutil.copyfileobj(source, output)
-                    target.chmod(member.mode & 0o777)
-        except RuntimeOperationError:
-            raise
-        except (tarfile.TarError, OSError) as error:
-            raise RuntimeOperationError(
-                "archive_extract_failed",
-                "restore.extract",
-                f"Failed to extract workspace archive: {error}",
-                422,
-            ) from error
-
-        manifest = workspace_manifest_for_root(session_id, staging)
-        actual_workspace_digest = manifest.get("digest") or ""
+    with open_restore_archive(archive_source) as archive_file:
+        if not actual_archive_sha256:
+            actual_archive_sha256 = archive_file_sha256(archive_file)
         if (
-            archive_format == ARCHIVE_FORMAT
-            and expected_workspace_digest
-            and actual_workspace_digest != expected_workspace_digest
+            expected_archive_sha256
+            and actual_archive_sha256 != expected_archive_sha256
         ):
             raise RuntimeOperationError(
-                "workspace_digest_mismatch",
-                "restore.verify",
-                "Extracted workspace digest does not match archive metadata",
+                "archive_checksum_mismatch",
+                "restore.validate",
+                "Archive checksum does not match R2 metadata",
                 409,
                 {
-                    "expectedWorkspaceDigest": expected_workspace_digest,
-                    "actualWorkspaceDigest": actual_workspace_digest,
+                    "expectedArchiveSha256": expected_archive_sha256,
+                    "actualArchiveSha256": actual_archive_sha256,
                 },
             )
 
-        runtime_chown(staging)
         try:
-            if root.exists():
-                root.rename(backup)
-            staging.rename(root)
-        except Exception as error:
-            if not root.exists() and backup.exists():
-                backup.rename(root)
-            raise RuntimeOperationError(
-                "workspace_swap_failed",
-                "restore.swap",
-                f"Failed to activate restored workspace: {error}",
-            ) from error
+            staging.mkdir(parents=True, exist_ok=False)
+            try:
+                archive_file.seek(0)
+                with tarfile.open(fileobj=archive_file, mode="r|gz") as tar:
+                    for member in tar:
+                        relative = safe_archive_member_path(member.name)
+                        if member.isdir():
+                            (staging.joinpath(*relative.parts)).mkdir(
+                                parents=True, exist_ok=True
+                            )
+                            continue
+                        if not member.isfile():
+                            raise RuntimeOperationError(
+                                "unsupported_archive_entry",
+                                "restore.validate",
+                                f"Unsupported archive entry: {member.name}",
+                                422,
+                                {
+                                    "path": member.name,
+                                    "type": member.type.decode(errors="ignore"),
+                                },
+                            )
+                        source = tar.extractfile(member)
+                        if source is None:
+                            raise RuntimeOperationError(
+                                "archive_entry_unreadable",
+                                "restore.extract",
+                                f"Archive entry cannot be read: {member.name}",
+                                422,
+                                {"path": member.name},
+                            )
+                        target = staging.joinpath(*relative.parts)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with source, target.open("wb") as output:
+                            shutil.copyfileobj(
+                                source,
+                                output,
+                                length=ARCHIVE_IO_CHUNK_BYTES,
+                            )
+                        target.chmod(member.mode & 0o777)
+            except RuntimeOperationError:
+                raise
+            except (tarfile.TarError, OSError) as error:
+                raise RuntimeOperationError(
+                    "archive_extract_failed",
+                    "restore.extract",
+                    f"Failed to extract workspace archive: {error}",
+                    422,
+                ) from error
 
-        if backup.exists():
-            shutil.rmtree(backup, ignore_errors=True)
-        return {
-            **manifest,
-            "workspace": str(root),
-            "archive_format": archive_format,
-            "archive_sha256": actual_archive_sha256,
-        }
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+            manifest = workspace_manifest_for_root(session_id, staging)
+            actual_workspace_digest = manifest.get("digest") or ""
+            if (
+                archive_format == ARCHIVE_FORMAT
+                and expected_workspace_digest
+                and actual_workspace_digest != expected_workspace_digest
+            ):
+                raise RuntimeOperationError(
+                    "workspace_digest_mismatch",
+                    "restore.verify",
+                    "Extracted workspace digest does not match archive metadata",
+                    409,
+                    {
+                        "expectedWorkspaceDigest": expected_workspace_digest,
+                        "actualWorkspaceDigest": actual_workspace_digest,
+                    },
+                )
+
+            runtime_chown(staging)
+            try:
+                if root.exists():
+                    root.rename(backup)
+                staging.rename(root)
+            except Exception as error:
+                if not root.exists() and backup.exists():
+                    backup.rename(root)
+                raise RuntimeOperationError(
+                    "workspace_swap_failed",
+                    "restore.swap",
+                    f"Failed to activate restored workspace: {error}",
+                ) from error
+
+            if backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+            return {
+                **manifest,
+                "workspace": str(root),
+                "archive_format": archive_format,
+                "archive_sha256": actual_archive_sha256,
+            }
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
 
 
 def serve_file(handler, path: Path):
@@ -2801,36 +2871,39 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
             if len(parts) == 2 and parts[0] == "archive":
-                max_bytes = archive_max_bytes(parsed)
-                archive_file, manifest, archive_sha256, archive_size = (
-                    make_archive(parts[1], max_bytes)
-                )
-                try:
-                    self.send_response(200)
-                    self.send_header("content-type", "application/gzip")
-                    self.send_header("content-length", str(archive_size))
-                    self.send_header("x-archive-sha256", archive_sha256)
-                    self.send_header("x-workspace-digest", manifest["digest"])
-                    self.send_header(
-                        "x-file-count", str(manifest["file_count"])
+                with workspace_file_transfer(parts[1], "archive.lock"):
+                    max_bytes = archive_max_bytes(parsed)
+                    archive_file, manifest, archive_sha256, archive_size = (
+                        make_archive(parts[1], max_bytes)
                     )
-                    self.send_header(
-                        "x-workspace-total-bytes",
-                        str(manifest["total_bytes"]),
-                    )
-                    self.send_header(
-                        "x-skipped-file-count",
-                        str(manifest["skipped_count"]),
-                    )
-                    self.send_header("x-archive-format", ARCHIVE_FORMAT)
-                    self.end_headers()
-                    shutil.copyfileobj(
-                        archive_file,
-                        self.wfile,
-                        length=ARCHIVE_IO_CHUNK_BYTES,
-                    )
-                finally:
-                    archive_file.close()
+                    try:
+                        self.send_response(200)
+                        self.send_header("content-type", "application/gzip")
+                        self.send_header("content-length", str(archive_size))
+                        self.send_header("x-archive-sha256", archive_sha256)
+                        self.send_header(
+                            "x-workspace-digest", manifest["digest"]
+                        )
+                        self.send_header(
+                            "x-file-count", str(manifest["file_count"])
+                        )
+                        self.send_header(
+                            "x-workspace-total-bytes",
+                            str(manifest["total_bytes"]),
+                        )
+                        self.send_header(
+                            "x-skipped-file-count",
+                            str(manifest["skipped_count"]),
+                        )
+                        self.send_header("x-archive-format", ARCHIVE_FORMAT)
+                        self.end_headers()
+                        shutil.copyfileobj(
+                            archive_file,
+                            self.wfile,
+                            length=ARCHIVE_IO_CHUNK_BYTES,
+                        )
+                    finally:
+                        archive_file.close()
                 return
             if len(parts) >= 2 and parts[0] == "preview":
                 session_id = parts[1]
@@ -2872,12 +2945,16 @@ class Handler(BaseHTTPRequestHandler):
                 write_json(self, 200, seed_workspace(parts[1]))
                 return
             if len(parts) == 2 and parts[0] == "clear":
-                agent = safe_agent(parse_qs(parsed.query).get("agent", ["claude"])[0])
-                kill_tmux(parts[1], agent)
-                root = session_path(parts[1])
-                if root.exists():
-                    shutil.rmtree(root)
-                write_json(self, 200, workspace_manifest(parts[1]))
+                with workspace_file_transfer(parts[1], "clear.lock"):
+                    agent = safe_agent(
+                        parse_qs(parsed.query).get("agent", ["claude"])[0]
+                    )
+                    kill_tmux(parts[1], agent)
+                    root = session_path(parts[1])
+                    if root.exists():
+                        shutil.rmtree(root)
+                    result = workspace_manifest(parts[1])
+                write_json(self, 200, result)
                 return
             write_json(self, 404, {"ok": False, "error": "not_found", "path": parsed.path})
         except Exception as error:
@@ -2931,28 +3008,33 @@ class Handler(BaseHTTPRequestHandler):
                     411,
                 )
             length = int(raw_length)
-            active_agents = sorted(
-                agent for agent in AGENTS if tmux_exists(parts[1], agent)
-            )
-            if active_agents:
-                raise RuntimeOperationError(
-                    "active_workspace_restore_blocked",
-                    "restore.guard",
-                    "Restore blocked because the workspace has an active terminal session",
-                    409,
-                    {"activeAgents": active_agents},
+            with workspace_file_transfer(parts[1], "restore.lock"):
+                active_agents = sorted(
+                    agent for agent in AGENTS if tmux_exists(parts[1], agent)
                 )
-            write_json(
-                self,
-                200,
-                restore_archive(
-                    parts[1],
-                    self.rfile.read(length),
-                    self.headers.get("x-expected-workspace-digest", ""),
-                    self.headers.get("x-expected-archive-sha256", ""),
-                    self.headers.get("x-archive-format", "1"),
-                ),
-            )
+                if active_agents:
+                    raise RuntimeOperationError(
+                        "active_workspace_restore_blocked",
+                        "restore.guard",
+                        "Restore blocked because the workspace has an active terminal session",
+                        409,
+                        {"activeAgents": active_agents},
+                    )
+                archive_file, archive_sha256 = spool_restore_archive(
+                    self.rfile, length
+                )
+                try:
+                    result = restore_archive(
+                        parts[1],
+                        archive_file,
+                        self.headers.get("x-expected-workspace-digest", ""),
+                        self.headers.get("x-expected-archive-sha256", ""),
+                        self.headers.get("x-archive-format", "1"),
+                        actual_archive_sha256=archive_sha256,
+                    )
+                finally:
+                    archive_file.close()
+            write_json(self, 200, result)
         except Exception as error:
             write_runtime_error(
                 self,

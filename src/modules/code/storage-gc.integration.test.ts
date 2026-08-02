@@ -11,6 +11,7 @@ import {
 import { getUuid } from '@/lib/hash';
 
 import { acquireArchiveLock, releaseArchiveLock } from './service';
+import { cleanupStorage } from './storage-cleanup';
 import {
   planStorageGc,
   settleConfirmedStorageGcDeletion,
@@ -140,6 +141,14 @@ try {
     throw new Error('GC must not reach Runtime while lifecycle lock is held');
   };
   try {
+    await assert.rejects(
+      cleanupStorage({
+        userId,
+        sessionId,
+        scope: 'snapshots',
+      }),
+      /archive operation is already running/i
+    );
     const lockedSweep = await sweepStorageGc({
       objects: [
         {
@@ -159,6 +168,18 @@ try {
   } finally {
     globalThis.fetch = originalFetch;
     await releaseArchiveLock(session, lifecycleLock);
+  }
+
+  globalThis.fetch = async () => {
+    throw new Error('Active current archive cleanup must fail before Runtime');
+  };
+  try {
+    await assert.rejects(
+      cleanupStorage({ userId, sessionId, scope: 'session' }),
+      /current archive of an active session cannot be deleted/i
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 
   const settled = await settleConfirmedStorageGcDeletion([
