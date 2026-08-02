@@ -4,6 +4,8 @@ import type {
   WorkspaceFileContentResult,
   WorkspaceFilePreviewKind,
   WorkspaceStatusResult,
+  WorkspaceTransferState,
+  WorkspaceTransferStatusResult,
 } from '@/lib/code-files';
 
 import { workspaceFilesUrl } from './runtime';
@@ -25,6 +27,15 @@ interface RuntimeStatusPayload {
   digest?: string | null;
   entryCount?: number;
   truncated?: boolean;
+  code?: string;
+  error?: string;
+}
+
+interface RuntimeTransferStatusPayload {
+  ok?: boolean;
+  transferId?: string;
+  transferState?: WorkspaceTransferState;
+  transferBusy?: boolean;
   code?: string;
   error?: string;
 }
@@ -104,6 +115,14 @@ const FORWARDED_UPLOAD_HEADERS = [
   'if-match',
   'if-none-match',
 ] as const;
+const WORKSPACE_TRANSFER_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+const WORKSPACE_TRANSFER_STATES = new Set<WorkspaceTransferState>([
+  'not_started',
+  'preparing',
+  'streaming',
+  'completed',
+  'failed',
+]);
 
 export type WorkspaceRuntimeSecretResolver = (options?: {
   fresh?: boolean;
@@ -126,6 +145,13 @@ function normalizeWorkspacePath(value: unknown): string {
     throw new WorkspaceFilesError('invalid_path', 400);
   }
   return path;
+}
+
+function normalizeWorkspaceTransferId(value: unknown): string {
+  if (typeof value !== 'string' || !WORKSPACE_TRANSFER_ID_PATTERN.test(value)) {
+    throw new WorkspaceFilesError('invalid_transfer_id', 400);
+  }
+  return value;
 }
 
 export function assertSameOriginRequest(request: Request): void {
@@ -174,9 +200,11 @@ function runtimePayloadError(
     file_read_failed: 502,
     file_too_large: 413,
     invalid_path: 400,
+    invalid_transfer_id: 400,
     invalid_upload_precondition: 400,
     invalid_workspace_max_bytes: 400,
     not_a_file: 400,
+    transfer_not_available: 409,
     unsupported_file_type: 415,
     unsupported_file: 415,
     upload_incomplete: 400,
@@ -573,6 +601,46 @@ export async function getWorkspaceStatus(
   };
 }
 
+export async function getWorkspaceTransferStatus(
+  userId: string,
+  sessionId: string,
+  requestedTransferId: unknown,
+  cancel: boolean,
+  resolveSecret: WorkspaceRuntimeSecretResolver
+): Promise<WorkspaceTransferStatusResult> {
+  const session = await ownedActiveSession(userId, sessionId);
+  const transferId = normalizeWorkspaceTransferId(requestedTransferId);
+  const url = new URL(
+    workspaceFilesUrl(
+      envConfigs.runtime_base_url,
+      session.runtimeUserId,
+      session.id,
+      'status'
+    )
+  );
+  url.searchParams.set('transferOnly', '1');
+  url.searchParams.set('transferId', transferId);
+  if (cancel) url.searchParams.set('cancel', '1');
+  const payload = await runtimeFilesRequest<RuntimeTransferStatusPayload>(
+    url.toString(),
+    resolveSecret
+  );
+  if (
+    payload.transferId !== transferId ||
+    typeof payload.transferState !== 'string' ||
+    !WORKSPACE_TRANSFER_STATES.has(payload.transferState) ||
+    typeof payload.transferBusy !== 'boolean'
+  ) {
+    throw new WorkspaceFilesError('invalid_runtime_response', 502);
+  }
+  return {
+    sessionStatus: session.status,
+    transferId,
+    transferState: payload.transferState,
+    transferBusy: payload.transferBusy,
+  };
+}
+
 export async function getWorkspaceFileContent(
   userId: string,
   sessionId: string,
@@ -755,18 +823,24 @@ export async function uploadWorkspaceFile(
 export async function getWorkspaceDownloadAllResponse(
   userId: string,
   sessionId: string,
+  requestedTransferId: unknown,
   resolveSecret: WorkspaceRuntimeSecretResolver
 ): Promise<Response> {
   const session = requiredActiveSession(
     await ownedActiveSession(userId, sessionId)
   );
-  const response = await requestRuntimeWithSecret(
+  const transferId = normalizeWorkspaceTransferId(requestedTransferId);
+  const url = new URL(
     workspaceFilesUrl(
       envConfigs.runtime_base_url,
       session.runtimeUserId,
       session.id,
       'download-all'
-    ),
+    )
+  );
+  url.searchParams.set('transferId', transferId);
+  const response = await requestRuntimeWithSecret(
+    url.toString(),
     resolveSecret,
     RUNTIME_WORKSPACE_DOWNLOAD_TIMEOUT_MS,
     { headers: { accept: 'application/zip' } }

@@ -45,7 +45,8 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return json.data as T;
 }
 
-export const apiGet = <T>(url: string) => request<T>(url);
+export const apiGet = <T>(url: string, options?: { signal?: AbortSignal }) =>
+  request<T>(url, { signal: options?.signal });
 
 export const apiPost = <T = void>(url: string, body?: unknown) =>
   request<T>(url, {

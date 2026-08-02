@@ -1,3 +1,8 @@
+import {
+  waitForWorkspaceDownloadCompletion,
+  type WorkspaceTransferStatusResult,
+} from './code-files';
+
 export const SANDBOX_UPLOAD_MAX_FILES = 10;
 export const SANDBOX_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
 
@@ -129,9 +134,19 @@ export async function uploadSandboxFile(options: {
   return payload?.data;
 }
 
-export function downloadSandboxArchive(sessionId: string): void {
+export function createSandboxTransferId(): string {
+  return crypto.randomUUID();
+}
+
+export function downloadSandboxArchive(
+  sessionId: string,
+  transferId: string
+): void {
   const link = document.createElement('a');
-  link.href = filesEndpoint(sessionId, { operation: 'download-all' });
+  link.href = filesEndpoint(sessionId, {
+    operation: 'download-all',
+    transferId,
+  });
   // An empty download attribute keeps the transfer in the browser's streaming
   // download path. The server's Content-Disposition header supplies the name.
   link.download = '';
@@ -143,4 +158,23 @@ export function downloadSandboxArchive(sessionId: string): void {
   } finally {
     link.remove();
   }
+}
+
+export async function downloadSandboxArchiveAndWait(options: {
+  sessionId: string;
+  readStatus: (
+    transferId: string,
+    cancel?: boolean
+  ) => Promise<WorkspaceTransferStatusResult>;
+  createTransferId?: () => string;
+  triggerDownload?: (sessionId: string, transferId: string) => void;
+}): Promise<void> {
+  const transferId = (options.createTransferId || createSandboxTransferId)();
+  (options.triggerDownload || downloadSandboxArchive)(
+    options.sessionId,
+    transferId
+  );
+  await waitForWorkspaceDownloadCompletion({
+    readStatus: (cancel) => options.readStatus(transferId, cancel),
+  });
 }

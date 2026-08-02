@@ -7,6 +7,7 @@ import {
   getWorkspaceFileContent,
   getWorkspaceFileRawResponse,
   getWorkspaceStatus,
+  getWorkspaceTransferStatus,
   listWorkspaceDirectory,
   uploadWorkspaceFile,
   WorkspaceFilesError,
@@ -60,6 +61,19 @@ async function GET({
         )
       );
     }
+    if (operation === 'transfer-status') {
+      return privateNoStore(
+        respData(
+          await getWorkspaceTransferStatus(
+            user.id,
+            params.id,
+            url.searchParams.get('transferId'),
+            url.searchParams.get('cancel') === '1',
+            resolveRuntimeSecret
+          )
+        )
+      );
+    }
     if (operation === 'content') {
       const path = url.searchParams.get('path') || '';
       if (url.searchParams.get('raw') === 'true') {
@@ -85,6 +99,7 @@ async function GET({
       return getWorkspaceDownloadAllResponse(
         user.id,
         params.id,
+        url.searchParams.get('transferId'),
         resolveRuntimeSecret
       );
     }

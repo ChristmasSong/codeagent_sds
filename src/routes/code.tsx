@@ -7,7 +7,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useIsMutating, useQuery } from '@tanstack/react-query';
 import { createFileRoute, redirect } from '@tanstack/react-router';
 import { createServerFn } from '@tanstack/react-start';
 import {
@@ -51,7 +51,10 @@ import {
   type TerminalStatus,
 } from '@/modules/code/use-terminal-session';
 import { ApiError, apiGet, apiPost } from '@/lib/api-client';
-import type { WorkspaceFileEntry } from '@/lib/code-files';
+import {
+  SANDBOX_DOWNLOAD_MUTATION_KEY,
+  type WorkspaceFileEntry,
+} from '@/lib/code-files';
 import { cn } from '@/lib/utils';
 import { SandboxFilePreview } from '@/components/code-workspace/sandbox-file-preview';
 import {
@@ -222,7 +225,10 @@ function CodeWorkspacePage() {
   const [selectedFile, setSelectedFile] = useState<WorkspaceFileEntry | null>(
     null
   );
-  const [fileTransferBusy, setFileTransferBusy] = useState(false);
+  const [fileTreeTransferBusy, setFileTreeTransferBusy] = useState(false);
+  const downloadTransferBusy =
+    useIsMutating({ mutationKey: SANDBOX_DOWNLOAD_MUTATION_KEY }) > 0;
+  const fileTransferBusy = fileTreeTransferBusy || downloadTransferBusy;
   const sandboxFileTreeRef = useRef<SandboxFileTreeHandle | null>(null);
   const workbenchRef = useRef<HTMLDivElement | null>(null);
   const workspaceFilesRef = useRef<HTMLDivElement | null>(null);
@@ -1860,7 +1866,7 @@ function CodeWorkspacePage() {
                       visible={filesPanelVisible}
                       selectedPath={selectedFile?.path}
                       onFileSelect={setSelectedFile}
-                      onTransferBusyChange={setFileTransferBusy}
+                      onTransferBusyChange={setFileTreeTransferBusy}
                       labels={{
                         refresh: m['code.files.refresh'](),
                         loading: m['code.files.loading'](),

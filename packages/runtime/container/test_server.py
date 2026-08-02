@@ -5,6 +5,7 @@ import json
 import os
 import tarfile
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -46,6 +47,24 @@ class BoundedReadStream(io.BytesIO):
         if size < 0 or size > self.max_read_size:
             raise AssertionError(f"unbounded archive read requested: {size}")
         return super().read(min(size, self.per_read_limit))
+
+
+class BlockingWriteStream(io.BytesIO):
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def write(self, data):
+        self.started.set()
+        if not self.release.wait(5):
+            raise AssertionError("timed out waiting to release download stream")
+        return super().write(data)
+
+
+class FailingWriteStream(io.BytesIO):
+    def write(self, _data):
+        raise BrokenPipeError("test download client disconnected")
 
 
 class AgentCredentialTests(unittest.TestCase):
@@ -1026,6 +1045,98 @@ class WorkspaceFilesTest(unittest.TestCase):
         )
         with zipfile.ZipFile(io.BytesIO(handler.wfile.getvalue())) as archive:
             self.assertEqual(archive.read("README.md"), b"# Demo\n")
+
+    def test_download_transfer_status_covers_the_complete_response_stream(self):
+        transfer_id = "transfer-blocked-0001"
+        handler = RecordingHandler()
+        handler.wfile = BlockingWriteStream()
+        errors = []
+
+        def download():
+            try:
+                server.serve_workspace_zip(handler, "session-1", transfer_id)
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=download)
+        thread.start()
+        self.assertTrue(handler.wfile.started.wait(5))
+
+        running = server.workspace_file_transfer_status(
+            "session-1", transfer_id
+        )
+        self.assertEqual(running["transferState"], "streaming")
+        self.assertTrue(running["transferBusy"])
+        cancel_running = server.workspace_file_transfer_status(
+            "session-1", transfer_id, cancel=True
+        )
+        self.assertEqual(cancel_running["transferState"], "streaming")
+        self.assertTrue(cancel_running["transferBusy"])
+        other_session = server.workspace_file_transfer_status(
+            "session-2", transfer_id
+        )
+        self.assertEqual(other_session["transferState"], "not_started")
+        self.assertFalse(other_session["transferBusy"])
+
+        handler.wfile.release.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        completed = server.workspace_file_transfer_status(
+            "session-1", transfer_id
+        )
+        self.assertEqual(completed["transferState"], "completed")
+        self.assertFalse(completed["transferBusy"])
+
+    def test_download_transfer_status_records_stream_failure(self):
+        transfer_id = "transfer-failed-00001"
+        handler = RecordingHandler()
+        handler.wfile = FailingWriteStream()
+
+        with self.assertRaises(BrokenPipeError):
+            server.serve_workspace_zip(handler, "session-1", transfer_id)
+
+        failed = server.workspace_file_transfer_status("session-1", transfer_id)
+        self.assertEqual(failed["transferState"], "failed")
+        self.assertFalse(failed["transferBusy"])
+
+    def test_transfer_status_is_lightweight_and_validates_transfer_id(self):
+        transfer_id = "transfer-status-000001"
+        handler = RecordingHandler()
+        handler.path = (
+            f"/files/session-1/status?transferOnly=1&transferId={transfer_id}"
+        )
+        with mock.patch.object(
+            server,
+            "workspace_metadata_status",
+            side_effect=AssertionError("transfer status must not scan workspace"),
+        ):
+            server.Handler.do_GET(handler)
+
+        self.assertEqual(handler.status, 200)
+        status = json.loads(handler.wfile.getvalue())
+        self.assertEqual(status["transferState"], "not_started")
+        self.assertFalse(status["transferBusy"])
+        with self.assertRaises(server.RuntimeOperationError) as invalid:
+            server.workspace_file_transfer_status("session-1", "short")
+        self.assertEqual(invalid.exception.code, "invalid_transfer_id")
+
+    def test_cancelled_download_id_cannot_start_late(self):
+        transfer_id = "transfer-cancelled-0001"
+        cancelled = server.workspace_file_transfer_status(
+            "session-1", transfer_id, cancel=True
+        )
+        self.assertEqual(cancelled["transferState"], "failed")
+        self.assertFalse(cancelled["transferBusy"])
+
+        with self.assertRaises(server.RuntimeOperationError) as rejected:
+            server.serve_workspace_zip(
+                RecordingHandler(), "session-1", transfer_id
+            )
+        self.assertEqual(rejected.exception.code, "transfer_not_available")
+        after = server.workspace_file_transfer_status("session-1", transfer_id)
+        self.assertEqual(after["transferState"], "failed")
+        self.assertFalse(after["transferBusy"])
 
     def test_file_transfers_are_single_flight_per_session(self):
         with server.workspace_file_transfer("session-1", "test.lock"):

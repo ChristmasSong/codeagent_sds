@@ -25,6 +25,7 @@ import tarfile
 import tempfile
 import termios
 import threading
+import time
 import uuid
 import fcntl
 import zipfile
@@ -130,6 +131,11 @@ UPLOAD_REJECTED_SUFFIXES = {
 }
 WORKSPACE_FILE_LOCKS: dict[str, threading.Lock] = {}
 WORKSPACE_FILE_LOCKS_GUARD = threading.Lock()
+WORKSPACE_FILE_TRANSFER_STATES: dict[tuple[str, str], tuple[str, float]] = {}
+WORKSPACE_FILE_TRANSFER_STATE_LIMIT = 512
+WORKSPACE_FILE_TRANSFER_STATE_TTL_SECONDS = 35 * 60
+WORKSPACE_FILE_TRANSFER_TERMINAL_STATES = {"completed", "failed"}
+WORKSPACE_FILE_TRANSFER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
 class RuntimeOperationError(Exception):
@@ -573,6 +579,114 @@ def workspace_file_lock(session_id: str) -> threading.Lock:
             lock = threading.Lock()
             WORKSPACE_FILE_LOCKS[key] = lock
         return lock
+
+
+def workspace_file_transfer_id(raw: str) -> str:
+    if not WORKSPACE_FILE_TRANSFER_ID_PATTERN.fullmatch(raw or ""):
+        raise RuntimeOperationError(
+            "invalid_transfer_id",
+            "transfer.status",
+            "Workspace transfer ID is invalid",
+            400,
+        )
+    return raw
+
+
+def prune_workspace_file_transfer_states(now: float):
+    expired = [
+        key
+        for key, (state, updated_at) in WORKSPACE_FILE_TRANSFER_STATES.items()
+        if state in WORKSPACE_FILE_TRANSFER_TERMINAL_STATES
+        and now - updated_at >= WORKSPACE_FILE_TRANSFER_STATE_TTL_SECONDS
+    ]
+    for key in expired:
+        WORKSPACE_FILE_TRANSFER_STATES.pop(key, None)
+
+    overflow = len(WORKSPACE_FILE_TRANSFER_STATES) - WORKSPACE_FILE_TRANSFER_STATE_LIMIT
+    if overflow <= 0:
+        return
+    for key, (state, _) in list(WORKSPACE_FILE_TRANSFER_STATES.items()):
+        if overflow <= 0:
+            break
+        if state not in WORKSPACE_FILE_TRANSFER_TERMINAL_STATES:
+            continue
+        WORKSPACE_FILE_TRANSFER_STATES.pop(key, None)
+        overflow -= 1
+
+
+def record_workspace_file_transfer(
+    session_id: str, transfer_id: str, state: str
+):
+    if not transfer_id:
+        return
+    key = (safe_name(session_id), transfer_id)
+    now = time.monotonic()
+    with WORKSPACE_FILE_LOCKS_GUARD:
+        prune_workspace_file_transfer_states(now)
+        WORKSPACE_FILE_TRANSFER_STATES.pop(key, None)
+        WORKSPACE_FILE_TRANSFER_STATES[key] = (state, now)
+
+
+def begin_workspace_file_download(session_id: str, transfer_id: str):
+    if not transfer_id:
+        return
+    key = (safe_name(session_id), transfer_id)
+    now = time.monotonic()
+    with WORKSPACE_FILE_LOCKS_GUARD:
+        prune_workspace_file_transfer_states(now)
+        transfer = WORKSPACE_FILE_TRANSFER_STATES.get(key)
+        if transfer and transfer[0] in WORKSPACE_FILE_TRANSFER_TERMINAL_STATES:
+            raise RuntimeOperationError(
+                "transfer_not_available",
+                "export.lock",
+                "Workspace download transfer is no longer available",
+                409,
+            )
+        WORKSPACE_FILE_TRANSFER_STATES.pop(key, None)
+        WORKSPACE_FILE_TRANSFER_STATES[key] = ("preparing", now)
+
+
+def reject_workspace_file_download(session_id: str, transfer_id: str):
+    if not transfer_id:
+        return
+    key = (safe_name(session_id), transfer_id)
+    now = time.monotonic()
+    with WORKSPACE_FILE_LOCKS_GUARD:
+        prune_workspace_file_transfer_states(now)
+        transfer = WORKSPACE_FILE_TRANSFER_STATES.get(key)
+        if transfer and transfer[0] in {"preparing", "streaming", "completed"}:
+            return
+        WORKSPACE_FILE_TRANSFER_STATES.pop(key, None)
+        WORKSPACE_FILE_TRANSFER_STATES[key] = ("failed", now)
+
+
+def workspace_file_transfer_status(
+    session_id: str, transfer_id: str, cancel: bool = False
+):
+    transfer_id = workspace_file_transfer_id(transfer_id)
+    session_key = safe_name(session_id)
+    key = (session_key, transfer_id)
+    now = time.monotonic()
+    with WORKSPACE_FILE_LOCKS_GUARD:
+        prune_workspace_file_transfer_states(now)
+        lock = WORKSPACE_FILE_LOCKS.get(session_key)
+        transfer = WORKSPACE_FILE_TRANSFER_STATES.get(key)
+        state = transfer[0] if transfer else "not_started"
+        busy = bool(lock and lock.locked())
+        if cancel and (
+            state == "not_started"
+            or (state in {"preparing", "streaming"} and not busy)
+        ):
+            WORKSPACE_FILE_TRANSFER_STATES.pop(key, None)
+            WORKSPACE_FILE_TRANSFER_STATES[key] = ("failed", now)
+            state = "failed"
+    return {
+        "ok": True,
+        "session": session_id,
+        "transferId": transfer_id,
+        "transferState": state,
+        "transferBusy": busy,
+    }
 
 
 @contextmanager
@@ -1513,32 +1627,55 @@ def make_workspace_zip(
         os.close(root_fd)
 
 
-def serve_workspace_zip(handler, session_id: str):
-    with workspace_file_transfer(session_id, "export.lock"):
-        archive_file, metadata = make_workspace_zip(session_id)
-        filename = f"workspace-{safe_name(session_id)}.zip"
-        try:
-            handler.send_response(200)
-            handler.send_header("content-type", "application/zip")
-            handler.send_header("content-length", str(metadata["archiveBytes"]))
-            handler.send_header(
-                "content-disposition",
-                f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename, safe='')}",
+def serve_workspace_zip(handler, session_id: str, transfer_id: str = ""):
+    tracked_transfer_id = (
+        workspace_file_transfer_id(transfer_id) if transfer_id else ""
+    )
+    transfer_started = False
+    try:
+        with workspace_file_transfer(session_id, "export.lock"):
+            begin_workspace_file_download(session_id, tracked_transfer_id)
+            transfer_started = bool(tracked_transfer_id)
+            archive_file, metadata = make_workspace_zip(session_id)
+            filename = f"workspace-{safe_name(session_id)}.zip"
+            try:
+                handler.send_response(200)
+                handler.send_header("content-type", "application/zip")
+                handler.send_header(
+                    "content-length", str(metadata["archiveBytes"])
+                )
+                handler.send_header(
+                    "content-disposition",
+                    f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename, safe='')}",
+                )
+                handler.send_header("cache-control", "private, no-store")
+                handler.send_header("x-content-type-options", "nosniff")
+                handler.send_header("x-file-count", str(metadata["fileCount"]))
+                handler.send_header(
+                    "x-uncompressed-size", str(metadata["uncompressedBytes"])
+                )
+                handler.end_headers()
+                record_workspace_file_transfer(
+                    session_id, tracked_transfer_id, "streaming"
+                )
+                shutil.copyfileobj(
+                    archive_file,
+                    handler.wfile,
+                    length=FILE_TRANSFER_IO_CHUNK_BYTES,
+                )
+            finally:
+                archive_file.close()
+            record_workspace_file_transfer(
+                session_id, tracked_transfer_id, "completed"
             )
-            handler.send_header("cache-control", "private, no-store")
-            handler.send_header("x-content-type-options", "nosniff")
-            handler.send_header("x-file-count", str(metadata["fileCount"]))
-            handler.send_header(
-                "x-uncompressed-size", str(metadata["uncompressedBytes"])
+    except Exception:
+        if transfer_started:
+            record_workspace_file_transfer(
+                session_id, tracked_transfer_id, "failed"
             )
-            handler.end_headers()
-            shutil.copyfileobj(
-                archive_file,
-                handler.wfile,
-                length=FILE_TRANSFER_IO_CHUNK_BYTES,
-            )
-        finally:
-            archive_file.close()
+        else:
+            reject_workspace_file_download(session_id, tracked_transfer_id)
+        raise
 
 
 def should_skip_workspace_name(name: str, show_hidden: bool) -> bool:
@@ -2826,9 +2963,28 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 show_hidden = query.get("showHidden", ["false"])[0].lower() == "true"
                 if len(parts) == 3 and parts[2] == "download-all":
-                    serve_workspace_zip(self, parts[1])
+                    serve_workspace_zip(
+                        self,
+                        parts[1],
+                        query.get("transferId", [""])[0],
+                    )
                     return
                 if len(parts) == 3 and parts[2] == "status":
+                    if query.get("transferOnly", ["false"])[0].lower() in {
+                        "1",
+                        "true",
+                    }:
+                        write_json(
+                            self,
+                            200,
+                            workspace_file_transfer_status(
+                                parts[1],
+                                query.get("transferId", [""])[0],
+                                query.get("cancel", ["false"])[0].lower()
+                                in {"1", "true"},
+                            ),
+                        )
+                        return
                     write_json(
                         self,
                         200,

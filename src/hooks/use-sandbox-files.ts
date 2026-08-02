@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiGet } from '@/lib/api-client';
 import {
   nextWorkspaceStatusPollState,
+  SANDBOX_DOWNLOAD_MUTATION_KEY,
   shouldConfirmWorkspaceStatus,
   workspaceStatusPollInterval,
   type WorkspaceDirectoryResult,
@@ -11,9 +12,10 @@ import {
   type WorkspaceStatusPollState,
   type WorkspaceStatusPollTarget,
   type WorkspaceStatusResult,
+  type WorkspaceTransferStatusResult,
 } from '@/lib/code-files';
 import {
-  downloadSandboxArchive,
+  downloadSandboxArchiveAndWait,
   uploadSandboxFile,
 } from '@/lib/sandbox-file-transfer';
 
@@ -98,10 +100,21 @@ export function useSandboxFileUpload(sessionId: string | null) {
 
 export function useSandboxDownloadAll(sessionId: string | null) {
   return useMutation({
-    mutationFn: () => {
+    mutationKey: [...SANDBOX_DOWNLOAD_MUTATION_KEY, sessionId],
+    mutationFn: async () => {
       if (!sessionId) throw new Error('session_not_available');
-      downloadSandboxArchive(sessionId);
-      return Promise.resolve();
+      await downloadSandboxArchiveAndWait({
+        sessionId,
+        readStatus: (transferId, cancel = false) =>
+          apiGet<WorkspaceTransferStatusResult>(
+            filesEndpoint(sessionId, {
+              operation: 'transfer-status',
+              transferId,
+              ...(cancel ? { cancel: '1' } : {}),
+            }),
+            { signal: AbortSignal.timeout(20_000) }
+          ),
+      });
     },
   });
 }
