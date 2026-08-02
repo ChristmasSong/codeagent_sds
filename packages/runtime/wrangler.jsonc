@@ -6,6 +6,7 @@
   "vars": {
     "ANTHROPIC_API_BASE_URL": "https://yunwu.ai",
     "APP_BASE_URL": "https://hicode.run",
+    "WORKSPACE_ARCHIVE_HARD_LIMIT_BYTES": "2147483648",
     "YUNWU_USER_ID": "179285",
   },
   "triggers": {

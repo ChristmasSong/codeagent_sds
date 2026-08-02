@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { apiGet } from '@/lib/api-client';
 import {
   nextWorkspaceStatusPollState,
+  SANDBOX_DOWNLOAD_MUTATION_KEY,
   shouldConfirmWorkspaceStatus,
   workspaceStatusPollInterval,
   type WorkspaceDirectoryResult,
@@ -11,7 +12,12 @@ import {
   type WorkspaceStatusPollState,
   type WorkspaceStatusPollTarget,
   type WorkspaceStatusResult,
+  type WorkspaceTransferStatusResult,
 } from '@/lib/code-files';
+import {
+  downloadSandboxArchiveAndWait,
+  uploadSandboxFile,
+} from '@/lib/sandbox-file-transfer';
 
 function filesEndpoint(sessionId: string, params: Record<string, string> = {}) {
   const search = new URLSearchParams(params);
@@ -63,6 +69,53 @@ export function sandboxFileRawUrl(
     path,
     raw: 'true',
     ...(etag ? { v: etag } : {}),
+  });
+}
+
+export function useSandboxFileUpload(sessionId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (options: {
+      file: File;
+      path: string;
+      signal?: AbortSignal;
+    }) => {
+      if (!sessionId) throw new Error('session_not_available');
+      return uploadSandboxFile({ sessionId, ...options });
+    },
+    onSuccess: async () => {
+      if (!sessionId) return;
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ['code-files', sessionId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['code-workspace-status', sessionId],
+        }),
+      ]);
+    },
+  });
+}
+
+export function useSandboxDownloadAll(sessionId: string | null) {
+  return useMutation({
+    mutationKey: [...SANDBOX_DOWNLOAD_MUTATION_KEY, sessionId],
+    mutationFn: async () => {
+      if (!sessionId) throw new Error('session_not_available');
+      await downloadSandboxArchiveAndWait({
+        sessionId,
+        readStatus: (transferId, cancel = false) =>
+          apiGet<WorkspaceTransferStatusResult>(
+            filesEndpoint(sessionId, {
+              operation: 'transfer-status',
+              transferId,
+              ...(cancel ? { cancel: '1' } : {}),
+            }),
+            { signal: AbortSignal.timeout(20_000) }
+          ),
+      });
+    },
   });
 }
 

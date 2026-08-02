@@ -15,6 +15,7 @@ const ACTIONS = [
   'suspend',
   'discard',
   'end',
+  'delete-permanently',
 ] as const;
 type Action = (typeof ACTIONS)[number];
 
@@ -40,6 +41,12 @@ async function POST({
     const user = await currentUser(request);
     const body = await request.json().catch(() => ({}));
     if (!isAction(body.action)) return respErr('Invalid action');
+    if (
+      (body.action === 'discard' || body.action === 'delete-permanently') &&
+      body.confirmSessionId !== params.id
+    ) {
+      return respErr('Full session ID confirmation is required');
+    }
 
     const limited = enforceMinIntervalRateLimit(request, {
       intervalMs: 2000,
@@ -71,6 +78,10 @@ async function POST({
         return respData(await codeSessions.discardSession(user.id, params.id));
       case 'end':
         return respData(await codeSessions.endSession(user.id, params.id));
+      case 'delete-permanently':
+        return respData(
+          await codeSessions.deleteSessionPermanently(user.id, params.id)
+        );
     }
   } catch (error: any) {
     if (error instanceof codeSessions.CodeSessionStartError) {

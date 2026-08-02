@@ -1,13 +1,43 @@
+import { createHmac } from 'node:crypto';
+
 const baseUrl = (
   process.argv[2] ||
   'https://codeagent-spike-integrated-session-mvp.eric-wuyu1352.workers.dev'
 ).replace(/\/$/, '');
 const userId = 'demo-user';
 const sessionId = `integrated-${Date.now()}`;
+const runtimeSecret = (
+  process.env.BILLING_USAGE_WEBHOOK_SECRET ||
+  process.env.RUNTIME_SECRET ||
+  ''
+).trim();
+if (!runtimeSecret) {
+  throw new Error(
+    'BILLING_USAGE_WEBHOOK_SECRET (or RUNTIME_SECRET) is required'
+  );
+}
+
+function authorizedHeaders(headers = {}) {
+  return {
+    ...headers,
+    'x-hicode-runtime-secret': runtimeSecret,
+  };
+}
+
+function signedPreviewPrefix() {
+  const expiresAt = Math.floor(Date.now() / 1000) + 5 * 60;
+  const message = `preview:v1\0${userId}\0${sessionId}\0${expiresAt}`;
+  const signature = createHmac('sha256', runtimeSecret)
+    .update(message)
+    .digest('base64url');
+  const token = `${expiresAt}.${signature}`;
+  return `/preview/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}/${encodeURIComponent(token)}/`;
+}
 
 async function requestJson(path, options = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
     ...options,
+    headers: authorizedHeaders(options.headers),
     signal: AbortSignal.timeout(120000),
   });
   const text = await response.text();
@@ -25,6 +55,7 @@ async function requestJson(path, options = {}) {
 
 async function requestText(path) {
   const response = await fetch(`${baseUrl}${path}`, {
+    headers: authorizedHeaders(),
     signal: AbortSignal.timeout(120000),
   });
   const text = await response.text();
@@ -37,6 +68,7 @@ async function requestText(path) {
 async function requestError(path, options = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
     ...options,
+    headers: authorizedHeaders(options.headers),
     signal: AbortSignal.timeout(120000),
   });
   const text = await response.text();
@@ -54,42 +86,25 @@ async function requestError(path, options = {}) {
   return { status: response.status, payload };
 }
 
-function stripAnsi(text) {
-  return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
-}
-
-function connectTerminal() {
-  const wsUrl = `${baseUrl.replace(/^http/, 'ws')}/terminal/${userId}/${sessionId}`;
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(wsUrl);
-    let output = '';
-    const timeout = setTimeout(() => {
-      socket.close();
-      reject(new Error(output || 'timeout waiting for integrated terminal'));
-    }, 45000);
-    socket.addEventListener('open', () => {
-      socket.send(JSON.stringify({ type: 'resize', cols: 120, rows: 30 }));
-    });
-    socket.addEventListener('message', async (event) => {
-      if (typeof event.data === 'string') output += event.data;
-      else if (event.data instanceof Blob)
-        output += Buffer.from(await event.data.arrayBuffer()).toString('utf8');
-      else if (event.data instanceof ArrayBuffer)
-        output += Buffer.from(event.data).toString('utf8');
-      else output += String(event.data);
-
-      const compact = stripAnsi(output);
-      if (compact.includes('Connected to integrated tmux session')) {
-        clearTimeout(timeout);
-        socket.close();
-        resolve(compact);
-      }
-    });
-    socket.addEventListener('error', (event) => {
-      clearTimeout(timeout);
-      reject(new Error(`websocket error ${String(event)}`));
-    });
+async function requestRejectedJson(path, options = {}) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    ...options,
+    headers: authorizedHeaders(options.headers),
+    signal: AbortSignal.timeout(120000),
   });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(
+      `expected JSON rejection: status=${response.status} body=${text.slice(0, 500)}`
+    );
+  }
+  if (response.ok) {
+    throw new Error(`expected request rejection: ${JSON.stringify(payload)}`);
+  }
+  return { status: response.status, payload };
 }
 
 const health = await requestJson(`/container-health/${userId}`);
@@ -108,24 +123,57 @@ if (!appHtml.includes(`var sessionId = "${sessionId}"`))
 const seeded = await requestJson(`/seed/${userId}/${sessionId}`, {
   method: 'POST',
 });
-const previewHtml = await requestText(`/preview/${userId}/${sessionId}/`);
+const unsignedPreview = await requestError(`/preview/${userId}/${sessionId}/`);
+if (unsignedPreview.status !== 404) {
+  throw new Error(JSON.stringify(unsignedPreview, null, 2));
+}
+
+const previewPrefix = signedPreviewPrefix();
+const previewHtml = await requestText(previewPrefix);
 if (!previewHtml.includes('Integrated Preview')) throw new Error(previewHtml);
 
-const previewApi = await requestJson(
-  `/preview/${userId}/${sessionId}/api/session`
-);
+const previewStyles = await requestText(`${previewPrefix}assets/style.css`);
+if (!previewStyles.includes('font-family: system-ui')) {
+  throw new Error(previewStyles);
+}
+
+const previewApi = await requestJson(`${previewPrefix}api/session`);
 if (previewApi.userId !== userId || previewApi.sessionId !== sessionId) {
   throw new Error(JSON.stringify(previewApi, null, 2));
 }
 
-await connectTerminal();
-const tmuxBefore = await requestJson(`/tmux/${userId}/${sessionId}`);
-if (!tmuxBefore.exists) throw new Error(JSON.stringify(tmuxBefore, null, 2));
-await connectTerminal();
+const gatewayWithoutSession = await requestRejectedJson('/api/model/v1/models');
+if (
+  gatewayWithoutSession.status !== 401 ||
+  gatewayWithoutSession.payload.error?.type !==
+    'codeagent_gateway_session_required'
+) {
+  throw new Error(JSON.stringify(gatewayWithoutSession, null, 2));
+}
 
-const archived = await requestJson(`/archive/${userId}/${sessionId}`);
+const gatewayWithoutToken = await requestRejectedJson(
+  `/api/model/session/${encodeURIComponent(sessionId)}/v1/models`
+);
+if (
+  gatewayWithoutToken.status !== 401 ||
+  gatewayWithoutToken.payload.error?.type !== 'codeagent_gateway_unauthorized'
+) {
+  throw new Error(JSON.stringify(gatewayWithoutToken, null, 2));
+}
+
+const targetArchiveKey = `integrated-workspaces/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}/archives/smoke-${encodeURIComponent(sessionId)}.tar.gz`;
+const archived = await requestJson(
+  `/archive/${userId}/${sessionId}?maxBytes=${2 * 1024 ** 3}`,
+  {
+    method: 'POST',
+    headers: { 'x-hicode-target-archive-key': targetArchiveKey },
+  }
+);
 if (archived.archiveFormat !== '2') {
   throw new Error(`unexpected archive format: ${JSON.stringify(archived)}`);
+}
+if (archived.key !== targetArchiveKey) {
+  throw new Error(`unexpected archive key: ${JSON.stringify(archived)}`);
 }
 const blockedRestore = await requestError(`/restore/${userId}/${sessionId}`, {
   method: 'POST',
@@ -149,7 +197,9 @@ const cleared = await requestJson(`/clear/${userId}/${sessionId}`, {
 if (cleared.cleared?.exists !== false) {
   throw new Error(JSON.stringify(cleared, null, 2));
 }
-const restored = await requestJson(`/restore/${userId}/${sessionId}`);
+const restored = await requestJson(`/restore/${userId}/${sessionId}`, {
+  method: 'POST',
+});
 const after = await requestJson(`/inspect/${userId}/${sessionId}`);
 if (seeded.digest !== after.digest) {
   throw new Error(
@@ -157,15 +207,12 @@ if (seeded.digest !== after.digest) {
   );
 }
 
-const previewAfterRestore = await requestText(
-  `/preview/${userId}/${sessionId}/`
-);
+const previewAfterRestore = await requestText(previewPrefix);
 if (!previewAfterRestore.includes('Integrated Preview'))
   throw new Error(previewAfterRestore);
 
-console.log('Remote integrated session MVP smoke test passed');
+console.log('Remote runtime archive smoke test passed');
 console.log(`session: ${sessionId}`);
-console.log(`tmux: ${tmuxBefore.tmuxSession}`);
 console.log(`archive: ${archived.key}`);
 console.log(`digest: ${after.digest}`);
 console.log(`restoredObjectSize: ${restored.objectSize}`);

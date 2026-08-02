@@ -58,6 +58,7 @@ export interface CodeBillingSettings {
 
 export type CodeBillingAuthorizationReason =
   | 'insufficient_credits'
+  | 'model_mismatch'
   | 'model_costs_not_configured'
   | 'session_not_active';
 
@@ -78,6 +79,7 @@ export interface ModelUsageAuthorizationInput {
   estimatedInputTokens?: unknown;
   maxOutputTokens?: unknown;
   authorizationKey?: unknown;
+  requestedModel?: unknown;
 }
 
 export interface ModelTokenUsageInput {
@@ -405,6 +407,19 @@ export async function authorizeModelUsage(input: ModelUsageAuthorizationInput) {
       'session_not_active',
       'Code session is not active',
       { sessionId: row.id, status: row.status }
+    );
+  }
+
+  const requestedModel = optionalText(input.requestedModel, 160);
+  if (!requestedModel || requestedModel !== row.model) {
+    throw new CodeBillingAuthorizationError(
+      'model_mismatch',
+      'Requested model does not match the active code session',
+      {
+        sessionId: row.id,
+        expectedModel: row.model,
+        requestedModel,
+      }
     );
   }
 

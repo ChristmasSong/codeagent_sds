@@ -2,13 +2,18 @@ import { createFileRoute } from '@tanstack/react-router';
 
 import { getAuth } from '@/core/auth';
 import {
+  assertSameOriginRequest,
+  getWorkspaceDownloadAllResponse,
   getWorkspaceFileContent,
   getWorkspaceFileRawResponse,
   getWorkspaceStatus,
+  getWorkspaceTransferStatus,
   listWorkspaceDirectory,
+  uploadWorkspaceFile,
   WorkspaceFilesError,
   type WorkspaceRuntimeSecretResolver,
 } from '@/modules/code/files';
+import { getCodeStorageSettings } from '@/modules/code/storage';
 import { getAllConfigs } from '@/modules/config/service';
 import { respData, respErr } from '@/lib/resp';
 
@@ -56,6 +61,19 @@ async function GET({
         )
       );
     }
+    if (operation === 'transfer-status') {
+      return privateNoStore(
+        respData(
+          await getWorkspaceTransferStatus(
+            user.id,
+            params.id,
+            url.searchParams.get('transferId'),
+            url.searchParams.get('cancel') === '1',
+            resolveRuntimeSecret
+          )
+        )
+      );
+    }
     if (operation === 'content') {
       const path = url.searchParams.get('path') || '';
       if (url.searchParams.get('raw') === 'true') {
@@ -76,6 +94,17 @@ async function GET({
           )
         )
       );
+    }
+    if (operation === 'download-all') {
+      return getWorkspaceDownloadAllResponse(
+        user.id,
+        params.id,
+        url.searchParams.get('transferId'),
+        resolveRuntimeSecret
+      );
+    }
+    if (operation) {
+      throw new WorkspaceFilesError('invalid_operation', 400);
     }
     return privateNoStore(
       respData(
@@ -107,8 +136,53 @@ async function GET({
   }
 }
 
+async function PUT({
+  request,
+  params,
+}: {
+  request: Request;
+  params: { id: string };
+}) {
+  try {
+    const user = await currentUser(request);
+    assertSameOriginRequest(request);
+    const url = new URL(request.url);
+    if (url.searchParams.get('operation') !== 'upload') {
+      throw new WorkspaceFilesError('invalid_operation', 400);
+    }
+    const configs = await getAllConfigs();
+    const result = await uploadWorkspaceFile(
+      user.id,
+      params.id,
+      url.searchParams.get('path') || '',
+      request.body,
+      request.headers,
+      getCodeStorageSettings(configs).workspaceQuotaBytes,
+      resolveRuntimeSecret
+    );
+    return privateNoStore(respData(result));
+  } catch (error: unknown) {
+    await request.body?.cancel().catch(() => undefined);
+    const isUnauthorized =
+      error instanceof Error && error.message === 'Unauthorized';
+    const status =
+      error instanceof WorkspaceFilesError
+        ? error.status
+        : isUnauthorized
+          ? 401
+          : 500;
+    const message =
+      error instanceof WorkspaceFilesError
+        ? error.message
+        : isUnauthorized
+          ? 'unauthorized'
+          : 'workspace_request_failed';
+    return privateNoStore(respErr(message, { status }));
+  }
+}
+
 export const Route = createFileRoute('/api/code/sessions/$id/files')({
   server: {
-    handlers: { GET },
+    handlers: { GET, PUT },
   },
 });

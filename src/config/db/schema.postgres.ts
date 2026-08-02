@@ -7,6 +7,7 @@
  */
 
 import {
+  bigint,
   boolean,
   doublePrecision,
   index,
@@ -664,6 +665,8 @@ export const codeSession = table(
     title: text('title').notNull().default(''),
     archiveKey: text('archive_key'),
     archiveDigest: text('archive_digest'),
+    archiveLockToken: text('archive_lock_token').notNull().default(''),
+    archiveLockExpiresAt: timestamp('archive_lock_expires_at'),
     suspensionReason: text('suspension_reason').notNull().default(''),
     lastBilledAt: timestamp('last_billed_at'),
     billedCredits: integer('billed_credits').default(0).notNull(),
@@ -678,6 +681,7 @@ export const codeSession = table(
   (t) => [
     index('idx_code_session_user_status').on(t.userId, t.status),
     index('idx_code_session_user_last_active').on(t.userId, t.lastActiveAt),
+    index('idx_code_session_archive_lock').on(t.archiveLockExpiresAt),
   ]
 );
 
@@ -775,6 +779,168 @@ export const codeBillingEvent = table(
   ]
 );
 
+export const storageUsage = table(
+  'code_storage_usage',
+  {
+    userId: text('user_id')
+      .primaryKey()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    usedBytes: bigint('used_bytes', { mode: 'number' }).default(0).notNull(),
+    reservedBytes: bigint('reserved_bytes', { mode: 'number' })
+      .default(0)
+      .notNull(),
+    pendingDeleteBytes: bigint('pending_delete_bytes', { mode: 'number' })
+      .default(0)
+      .notNull(),
+    quotaOverrideBytes: bigint('quota_override_bytes', { mode: 'number' }),
+    reconciledAt: timestamp('reconciled_at'),
+    reconcileLockToken: text('reconcile_lock_token').notNull().default(''),
+    reconcileLockExpiresAt: timestamp('reconcile_lock_expires_at'),
+    version: integer('version').default(0).notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (t) => [
+    index('idx_code_storage_usage_used').on(t.usedBytes),
+    index('idx_code_storage_usage_updated').on(t.updatedAt),
+    index('idx_code_storage_usage_reconcile').on(t.reconciledAt),
+  ]
+);
+
+export const storagePlatformUsage = table('code_storage_platform_usage', {
+  id: text('id').primaryKey(),
+  usedBytes: bigint('used_bytes', { mode: 'number' }).default(0).notNull(),
+  reservedBytes: bigint('reserved_bytes', { mode: 'number' })
+    .default(0)
+    .notNull(),
+  pendingDeleteBytes: bigint('pending_delete_bytes', { mode: 'number' })
+    .default(0)
+    .notNull(),
+  observedBytes: bigint('observed_bytes', { mode: 'number' })
+    .default(0)
+    .notNull(),
+  observedObjects: integer('observed_objects').default(0).notNull(),
+  observedAt: timestamp('observed_at'),
+  version: integer('version').default(0).notNull(),
+  updatedAt: timestamp('updated_at')
+    .defaultNow()
+    .$onUpdate(() => new Date())
+    .notNull(),
+});
+
+export const storageReservation = table(
+  'code_storage_reservation',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    sessionId: text('session_id').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    requestedBytes: bigint('requested_bytes', { mode: 'number' }).notNull(),
+    replaceableBytes: bigint('replaceable_bytes', { mode: 'number' })
+      .default(0)
+      .notNull(),
+    reservedBytes: bigint('reserved_bytes', { mode: 'number' })
+      .default(0)
+      .notNull(),
+    actualBytes: bigint('actual_bytes', { mode: 'number' })
+      .default(0)
+      .notNull(),
+    replaceObjectId: text('replace_object_id'),
+    objectKey: text('object_key'),
+    status: text('status').default('reserved').notNull(),
+    expiresAt: timestamp('expires_at').notNull(),
+    settledAt: timestamp('settled_at'),
+    releasedAt: timestamp('released_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (t) => [
+    uniqueIndex('idx_code_storage_reservation_idempotency').on(
+      t.idempotencyKey
+    ),
+    index('idx_code_storage_reservation_user_status').on(t.userId, t.status),
+    index('idx_code_storage_reservation_expires').on(t.status, t.expiresAt),
+  ]
+);
+
+export const storageObject = table(
+  'code_storage_object',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    sessionId: text('session_id').notNull(),
+    key: text('key').notNull(),
+    kind: text('kind').default('current').notNull(),
+    status: text('status').default('pending').notNull(),
+    sizeBytes: bigint('size_bytes', { mode: 'number' }).default(0).notNull(),
+    digest: text('digest'),
+    reservationId: text('reservation_id').references(
+      () => storageReservation.id,
+      { onDelete: 'set null' }
+    ),
+    expiresAt: timestamp('expires_at'),
+    deletedAt: timestamp('deleted_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (t) => [
+    uniqueIndex('idx_code_storage_object_key').on(t.key),
+    uniqueIndex('idx_code_storage_object_reservation').on(t.reservationId),
+    index('idx_code_storage_object_user_status').on(t.userId, t.status),
+    index('idx_code_storage_object_session_status').on(t.sessionId, t.status),
+    index('idx_code_storage_object_expiry').on(t.status, t.expiresAt),
+  ]
+);
+
+export const storageDailyMetric = table(
+  'code_storage_daily_metric',
+  {
+    id: text('id').primaryKey(),
+    metricDate: text('metric_date').notNull(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    storedBytes: bigint('stored_bytes', { mode: 'number' })
+      .default(0)
+      .notNull(),
+    uploadedBytes: bigint('uploaded_bytes', { mode: 'number' })
+      .default(0)
+      .notNull(),
+    deletedBytes: bigint('deleted_bytes', { mode: 'number' })
+      .default(0)
+      .notNull(),
+    archiveCount: integer('archive_count').default(0).notNull(),
+    deleteCount: integer('delete_count').default(0).notNull(),
+    classAOperations: integer('class_a_operations').default(0).notNull(),
+    classBOperations: integer('class_b_operations').default(0).notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (t) => [
+    uniqueIndex('idx_code_storage_daily_metric_user_date').on(
+      t.userId,
+      t.metricDate
+    ),
+    index('idx_code_storage_daily_metric_date').on(t.metricDate),
+  ]
+);
+
 // ─── Invite Codes ────────────────────────────────────────────────────────────
 
 export const inviteCode = table(
@@ -818,6 +984,16 @@ export type CodeModel = typeof codeModel.$inferSelect;
 export type NewCodeModel = typeof codeModel.$inferInsert;
 export type CodeBillingEvent = typeof codeBillingEvent.$inferSelect;
 export type NewCodeBillingEvent = typeof codeBillingEvent.$inferInsert;
+export type StorageUsage = typeof storageUsage.$inferSelect;
+export type NewStorageUsage = typeof storageUsage.$inferInsert;
+export type StoragePlatformUsage = typeof storagePlatformUsage.$inferSelect;
+export type NewStoragePlatformUsage = typeof storagePlatformUsage.$inferInsert;
+export type StorageObject = typeof storageObject.$inferSelect;
+export type NewStorageObject = typeof storageObject.$inferInsert;
+export type StorageReservation = typeof storageReservation.$inferSelect;
+export type NewStorageReservation = typeof storageReservation.$inferInsert;
+export type StorageDailyMetric = typeof storageDailyMetric.$inferSelect;
+export type NewStorageDailyMetric = typeof storageDailyMetric.$inferInsert;
 export type InviteCode = typeof inviteCode.$inferSelect;
 export type NewInviteCode = typeof inviteCode.$inferInsert;
 export type UserInvite = typeof userInvite.$inferSelect;

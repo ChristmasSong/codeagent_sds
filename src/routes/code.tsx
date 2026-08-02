@@ -7,7 +7,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useIsMutating, useQuery } from '@tanstack/react-query';
 import { createFileRoute, redirect } from '@tanstack/react-router';
 import { createServerFn } from '@tanstack/react-start';
 import {
@@ -28,6 +28,7 @@ import {
   Plus,
   Square,
   Terminal,
+  Trash2,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -40,7 +41,6 @@ import type { CodeModelView } from '@/modules/code/models';
 import {
   CODE_SESSION_AGENTS,
   normalizeAgent,
-  previewUrl,
   shouldRestoreWorkspace,
   type CodeSessionAgent,
 } from '@/modules/code/runtime';
@@ -51,10 +51,16 @@ import {
   type TerminalStatus,
 } from '@/modules/code/use-terminal-session';
 import { ApiError, apiGet, apiPost } from '@/lib/api-client';
-import type { WorkspaceFileEntry } from '@/lib/code-files';
+import {
+  SANDBOX_DOWNLOAD_MUTATION_KEY,
+  type WorkspaceFileEntry,
+} from '@/lib/code-files';
 import { cn } from '@/lib/utils';
 import { SandboxFilePreview } from '@/components/code-workspace/sandbox-file-preview';
-import { SandboxFileTree } from '@/components/code-workspace/sandbox-file-tree';
+import {
+  SandboxFileTree,
+  type SandboxFileTreeHandle,
+} from '@/components/code-workspace/sandbox-file-tree';
 import { Button, buttonVariants } from '@/components/ui/button';
 import {
   Dialog,
@@ -64,6 +70,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
   Select,
@@ -82,7 +89,8 @@ type CodeAction =
   | 'resume'
   | 'suspend'
   | 'discard'
-  | 'end';
+  | 'end'
+  | 'delete-permanently';
 
 interface CodeActionResponse {
   session?: CodeSessionView;
@@ -129,6 +137,7 @@ const COLLAPSED_SESSIONS_WIDTH = 56;
 const MIN_TERMINAL_WIDTH = 420;
 const CODE_SIDEBAR_COLLAPSED_KEY = 'hicode:code-sidebar-collapsed';
 const SIDEBAR_TRANSITION_MS = 200;
+const AUTO_ARCHIVE_INTERVAL_MS = 5 * 60_000;
 const WIDE_WORKBENCH_MEDIA_QUERY = '(min-width: 80rem)';
 
 function workspaceWidthLimit(
@@ -192,8 +201,14 @@ function CodeWorkspacePage() {
   const [newSessionIssue, setNewSessionIssue] =
     useState<SessionStartIssue | null>(null);
   const [confirmNewSessionOpen, setConfirmNewSessionOpen] = useState(false);
+  const [discardConfirmation, setDiscardConfirmation] = useState('');
   const [confirmRestoreSession, setConfirmRestoreSession] =
     useState<CodeSessionView | null>(null);
+  const [confirmEndSessionOpen, setConfirmEndSessionOpen] = useState(false);
+  const [confirmPermanentDeleteSession, setConfirmPermanentDeleteSession] =
+    useState<CodeSessionView | null>(null);
+  const [permanentDeleteConfirmation, setPermanentDeleteConfirmation] =
+    useState('');
   const [runtimeIssue, setRuntimeIssue] = useState<string>('');
   const [busyAction, setBusyAction] = useState<string>('');
   const [previewNonce, setPreviewNonce] = useState(0);
@@ -210,6 +225,11 @@ function CodeWorkspacePage() {
   const [selectedFile, setSelectedFile] = useState<WorkspaceFileEntry | null>(
     null
   );
+  const [fileTreeTransferBusy, setFileTreeTransferBusy] = useState(false);
+  const downloadTransferBusy =
+    useIsMutating({ mutationKey: SANDBOX_DOWNLOAD_MUTATION_KEY }) > 0;
+  const fileTransferBusy = fileTreeTransferBusy || downloadTransferBusy;
+  const sandboxFileTreeRef = useRef<SandboxFileTreeHandle | null>(null);
   const workbenchRef = useRef<HTMLDivElement | null>(null);
   const workspaceFilesRef = useRef<HTMLDivElement | null>(null);
   const sidebarTransitionTimerRef = useRef<number | null>(null);
@@ -277,7 +297,17 @@ function CodeWorkspacePage() {
   const canCreateSession = Boolean(selectedModel && availableModels.length);
   const hasSession = Boolean(sessionId);
   const controlsDisabled =
-    !hasSession || Boolean(busyAction) || restoreInProgress;
+    !hasSession || Boolean(busyAction) || restoreInProgress || fileTransferBusy;
+  const cancelFileUpload = useCallback(() => {
+    sandboxFileTreeRef.current?.cancelUpload();
+  }, []);
+  const changeSession = useCallback(
+    (nextSessionId: string | null) => {
+      cancelFileUpload();
+      setSessionId(nextSessionId);
+    },
+    [cancelFileUpload]
+  );
   const markSessionRestoreReady = useCallback((id: string) => {
     setRestoredSessionIds((prev) =>
       prev[id] ? prev : { ...prev, [id]: true }
@@ -618,7 +648,14 @@ function CodeWorkspacePage() {
   }, [sessionId, status]);
 
   useEffect(() => {
-    if (!terminalSessionId || status !== 'connected' || busyAction) return;
+    if (
+      !terminalSessionId ||
+      status !== 'connected' ||
+      busyAction ||
+      fileTransferBusy
+    ) {
+      return;
+    }
     let cancelled = false;
     const timer = window.setInterval(() => {
       markArchiveSaving(terminalSessionId);
@@ -631,7 +668,7 @@ function CodeWorkspacePage() {
         .catch((error) => {
           if (!cancelled) markArchiveError(terminalSessionId, error);
         });
-    }, 60000);
+    }, AUTO_ARCHIVE_INTERVAL_MS);
 
     return () => {
       cancelled = true;
@@ -639,6 +676,7 @@ function CodeWorkspacePage() {
     };
   }, [
     busyAction,
+    fileTransferBusy,
     markArchiveError,
     markArchiveSaved,
     markArchiveSaving,
@@ -684,6 +722,7 @@ function CodeWorkspacePage() {
       revealSidebarFeedback();
       return;
     }
+    cancelFileUpload();
     setBusyAction('new');
     setNewSessionIssue(null);
     setNewSessionMsg(m['code.actions.running']());
@@ -698,7 +737,11 @@ function CodeWorkspacePage() {
       const cleanupErrors: string[] = [];
       for (const id of idsToEnd) {
         try {
-          const payload = await runSessionAction(id, currentAction);
+          const payload = await runSessionAction(
+            id,
+            currentAction,
+            currentAction === 'discard' ? { confirmSessionId: id } : undefined
+          );
           if (currentAction === 'suspend') {
             rememberArchivedSession(payload.session);
           }
@@ -712,7 +755,7 @@ function CodeWorkspacePage() {
         model: selectedModel,
       });
       setSessions([session]);
-      setSessionId(session.id);
+      changeSession(session.id);
       setArchiveCheckpoint(checkpointFromSession(session));
       markSessionRestoreReady(session.id);
       setSelectedAgent(session.agent);
@@ -741,6 +784,7 @@ function CodeWorkspacePage() {
 
   const requestNewSession = () => {
     if (sessionId) {
+      setDiscardConfirmation('');
       setConfirmNewSessionOpen(true);
       return;
     }
@@ -748,23 +792,72 @@ function CodeWorkspacePage() {
   };
 
   const requestRestoreArchivedSession = (session: CodeSessionView) => {
-    if (sessionId) {
-      setConfirmRestoreSession(session);
-      return;
+    if (session.deletionPending) return;
+    setConfirmRestoreSession(session);
+  };
+
+  const requestPermanentDeleteSession = (session: CodeSessionView) => {
+    setPermanentDeleteConfirmation('');
+    setConfirmPermanentDeleteSession(session);
+  };
+
+  const permanentlyDeleteSession = async (session: CodeSessionView) => {
+    const deletingId = session.id;
+    cancelFileUpload();
+    setBusyAction('delete-permanently');
+    setActionMsg(m['code.actions.running']());
+    try {
+      await runSessionAction(deletingId, 'delete-permanently', {
+        confirmSessionId: deletingId,
+      });
+      setSessions((prev) => prev.filter((item) => item.id !== deletingId));
+      setArchivedSessions((prev) =>
+        prev.filter((item) => item.id !== deletingId)
+      );
+      if (sessionId === deletingId) {
+        changeSession(null);
+        setArchiveCheckpoint(checkpointFromSession(null));
+      }
+      setConfirmPermanentDeleteSession(null);
+      setPermanentDeleteConfirmation('');
+      setActionMsg(m['code.actions.deleted_permanently']());
+      toast.success(m['code.actions.deleted_permanently']());
+    } catch (err) {
+      const message = (err as Error).message || 'error';
+      try {
+        const [nextSessions, nextArchivedSessions] = await Promise.all([
+          apiGet<CodeSessionView[]>('/api/code/sessions'),
+          apiGet<CodeSessionView[]>('/api/code/sessions?status=archived'),
+        ]);
+        setSessions(nextSessions);
+        setArchivedSessions(nextArchivedSessions);
+        if (
+          sessionId === deletingId &&
+          !nextSessions.some((item) => item.id === deletingId)
+        ) {
+          changeSession(nextSessions[0]?.id || null);
+        }
+      } catch {
+        // Preserve the deletion error when refreshing the retryable state fails.
+      }
+      setActionMsg(message);
+      toast.error(message);
+    } finally {
+      setBusyAction('');
     }
-    void restoreArchivedSession(session.id);
   };
 
   const endCurrentSession = async () => {
     if (!sessionId) return;
     const endingId = sessionId;
+    cancelFileUpload();
     setBusyAction('end');
     setActionMsg(m['code.actions.running']());
     try {
       const payload = await runSessionAction(endingId, 'end');
       rememberArchivedSession(payload.session);
       setSessions((prev) => prev.filter((session) => session.id !== endingId));
-      setSessionId(null);
+      changeSession(null);
       setActionMsg(formatActionMessage('end', payload));
     } catch (err) {
       setActionMsg((err as Error).message || 'error');
@@ -774,6 +867,7 @@ function CodeWorkspacePage() {
   };
 
   const restoreArchivedSession = async (archivedSessionId: string) => {
+    cancelFileUpload();
     setBusyAction('resume');
     setNewSessionIssue(null);
     setNewSessionMsg(m['code.actions.running']());
@@ -787,27 +881,19 @@ function CodeWorkspacePage() {
         setSessions((prev) =>
           prev.filter((session) => session.id !== sessionId)
         );
-        setSessionId(null);
+        changeSession(null);
       }
 
       const payload = await runSessionAction(archivedSessionId, 'resume');
       if (!payload.session) throw new Error('Restore failed');
-      const resumedSession = payload.session;
-      markSessionRestorePending(resumedSession.id);
-      setRestoreGate({
-        sessionId: resumedSession.id,
-        status: 'restoring',
-        message: m['code.actions.restoring'](),
-      });
-      const restorePayload = await restoreSessionBeforeConnect(
-        resumedSession.id
-      );
-      const session = restorePayload.session || resumedSession;
+      const session = payload.session;
+      markSessionRestoreReady(session.id);
+      markRestoreIntegrity(session.id, payload);
       setArchivedSessions((prev) =>
         prev.filter((item) => item.id !== session.id)
       );
       setSessions([session]);
-      setSessionId(session.id);
+      changeSession(session.id);
       setArchiveCheckpoint(checkpointFromSession(session));
       setSelectedAgent(session.agent);
       setSelectedModel(session.model);
@@ -818,7 +904,7 @@ function CodeWorkspacePage() {
         `${m['code.actions.restoring']()}: ${shortId(session.id)}`
       );
       setRestoreGate({ sessionId: session.id, status: 'ready', message: '' });
-      setActionMsg(formatActionMessage('restore', restorePayload));
+      setActionMsg(formatActionMessage('restore', payload));
     } catch (err) {
       const issue = sessionStartIssueFromError(err);
       const message = issue ? '' : (err as Error).message || 'error';
@@ -832,6 +918,9 @@ function CodeWorkspacePage() {
 
   const runAction = async (action: CodeAction) => {
     if (!sessionId) return;
+    if (action === 'archive' || action === 'restore' || action === 'suspend') {
+      cancelFileUpload();
+    }
     setBusyAction(action);
     setActionMsg(m['code.actions.running']());
     if (action === 'archive') {
@@ -844,7 +933,7 @@ function CodeWorkspacePage() {
         setSessions((prev) =>
           prev.filter((session) => session.id !== sessionId)
         );
-        setSessionId(null);
+        changeSession(null);
       } else if (payload.session) {
         setSessions((prev) => upsertSession(prev, payload.session!));
       }
@@ -1246,6 +1335,7 @@ function CodeWorkspacePage() {
                   disabled={
                     Boolean(busyAction) ||
                     restoreInProgress ||
+                    fileTransferBusy ||
                     !canCreateSession
                   }
                   onClick={requestNewSession}
@@ -1376,7 +1466,7 @@ function CodeWorkspacePage() {
                     session.id === sessionId ? 'bg-muted' : 'hover:bg-muted/70'
                   )}
                   onClick={() => {
-                    setSessionId(session.id);
+                    if (session.id !== sessionId) changeSession(session.id);
                     setSelectedAgent(session.agent);
                     setSelectedModel(session.model);
                     setActiveWorkbenchPane('terminal');
@@ -1423,31 +1513,57 @@ function CodeWorkspacePage() {
                   </p>
                 )}
                 {archivedSessions.map((session) => (
-                  <button
+                  <div
                     key={session.id}
-                    type="button"
-                    className="hover:bg-muted/70 flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60"
-                    disabled={Boolean(busyAction) || restoreInProgress}
-                    onClick={() => requestRestoreArchivedSession(session)}
+                    className="hover:bg-muted/70 flex w-full items-center gap-1 rounded-md pr-1 transition-colors"
                   >
-                    <span className="border-muted-foreground/40 size-2 rounded-full border" />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate font-mono text-xs">
-                        {session.id}
+                    <button
+                      type="button"
+                      className="flex min-w-0 flex-1 items-center gap-3 rounded-md px-3 py-2 text-left text-sm disabled:cursor-not-allowed disabled:opacity-60"
+                      disabled={
+                        Boolean(busyAction) ||
+                        restoreInProgress ||
+                        fileTransferBusy ||
+                        session.deletionPending
+                      }
+                      title={m['code.actions.restore_description']()}
+                      onClick={() => requestRestoreArchivedSession(session)}
+                    >
+                      <span className="border-muted-foreground/40 size-2 rounded-full border" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-mono text-xs">
+                          {session.id}
+                        </span>
+                        <span className="text-muted-foreground mt-0.5 flex items-center gap-1 text-[11px]">
+                          <Archive className="size-3" />
+                          {sessionStatusLabel(session.status)} ·{' '}
+                          {agentLabel(session.agent)}
+                        </span>
+                        <span className="text-muted-foreground mt-0.5 block truncate text-[11px]">
+                          {modelLabel(models, session)}
+                        </span>
                       </span>
-                      <span className="text-muted-foreground mt-0.5 flex items-center gap-1 text-[11px]">
-                        <Archive className="size-3" />
-                        {sessionStatusLabel(session.status)} ·{' '}
-                        {agentLabel(session.agent)}
+                      <span className="text-primary shrink-0 text-[11px] font-medium">
+                        {m['code.sessions.restore']()}
                       </span>
-                      <span className="text-muted-foreground mt-0.5 block truncate text-[11px]">
-                        {modelLabel(models, session)}
-                      </span>
-                    </span>
-                    <span className="text-primary shrink-0 text-[11px] font-medium">
-                      {m['code.sessions.restore']()}
-                    </span>
-                  </button>
+                    </button>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className="text-destructive hover:text-destructive size-7 shrink-0"
+                      disabled={
+                        Boolean(busyAction) ||
+                        restoreInProgress ||
+                        fileTransferBusy
+                      }
+                      aria-label={m['code.actions.delete_permanently']()}
+                      title={m['code.actions.delete_permanently_description']()}
+                      onClick={() => requestPermanentDeleteSession(session)}
+                    >
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                  </div>
                 ))}
               </div>
             </div>
@@ -1575,7 +1691,8 @@ function CodeWorkspacePage() {
                     disabled={
                       !terminalSessionId ||
                       Boolean(busyAction) ||
-                      restoreInProgress
+                      restoreInProgress ||
+                      fileTransferBusy
                     }
                     onClick={() => void reconnectTerminal()}
                   >
@@ -1743,11 +1860,13 @@ function CodeWorkspacePage() {
                   </div>
                   <div className="min-h-0 flex-1 overflow-hidden p-3">
                     <SandboxFileTree
+                      ref={sandboxFileTreeRef}
                       sessionId={sessionId}
                       sessionStatus={currentSession?.status}
                       visible={filesPanelVisible}
                       selectedPath={selectedFile?.path}
                       onFileSelect={setSelectedFile}
+                      onTransferBusyChange={setFileTreeTransferBusy}
                       labels={{
                         refresh: m['code.files.refresh'](),
                         loading: m['code.files.loading'](),
@@ -1756,6 +1875,22 @@ function CodeWorkspacePage() {
                         inactive: m['code.files.inactive'](),
                         truncated: m['code.files.truncated'](),
                         selected: m['code.files.selected'](),
+                        upload: m['code.files.upload'](),
+                        uploadHint: m['code.files.upload_hint'](),
+                        dropFiles: m['code.files.drop_files'](),
+                        uploadPending: m['code.files.upload_pending'](),
+                        uploading: m['code.files.uploading'](),
+                        uploadSuccess: m['code.files.upload_success'](),
+                        uploadFailed: m['code.files.upload_failed'](),
+                        uploadTooLarge: m['code.files.upload_too_large'](),
+                        uploadWorkspaceFull:
+                          m['code.files.upload_workspace_full'](),
+                        uploadUnsupported: m['code.files.upload_unsupported'](),
+                        uploadConflict: m['code.files.upload_conflict'](),
+                        uploadQueueLimit: m['code.files.upload_queue_limit'](),
+                        downloadAll: m['code.files.download_all'](),
+                        downloadPreparing: m['code.files.download_preparing'](),
+                        downloadFailed: m['code.files.download_failed'](),
                       }}
                     />
                   </div>
@@ -1855,11 +1990,11 @@ function CodeWorkspacePage() {
                       <iframe
                         title={m['code.preview.title']()}
                         className="h-full min-h-0 w-full bg-white"
-                        src={`${previewUrl(
-                          loader.runtimeBase,
-                          currentRuntimeUserId,
+                        src={`/api/code/sessions/${encodeURIComponent(
                           terminalSessionId
-                        )}?t=${previewNonce}`}
+                        )}/preview?t=${previewNonce}`}
+                        sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
+                        referrerPolicy="no-referrer"
                       />
                     ) : (
                       <div className="text-muted-foreground flex h-full items-center justify-center px-4 text-center text-xs">
@@ -1927,6 +2062,7 @@ function CodeWorkspacePage() {
                           variant="outline"
                           className="h-7 shrink-0 rounded-full text-xs"
                           disabled={controlsDisabled}
+                          title={m['code.actions.archive_description']()}
                           onClick={() => void runAction('archive')}
                         >
                           {m['code.archive.retry']()}
@@ -1940,6 +2076,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.health_description']()}
                     onClick={() => void runAction('health')}
                   >
                     {m['code.actions.health']()}
@@ -1949,6 +2086,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.inspect_description']()}
                     onClick={() => void runAction('inspect')}
                   >
                     {m['code.actions.inspect']()}
@@ -1958,6 +2096,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.archive_description']()}
                     onClick={() => void runAction('archive')}
                   >
                     {m['code.actions.archive']()}
@@ -1967,6 +2106,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.restore_description']()}
                     onClick={() => void runAction('restore')}
                   >
                     {m['code.actions.restore']()}
@@ -1976,6 +2116,7 @@ function CodeWorkspacePage() {
                     variant="outline"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
+                    title={m['code.actions.suspend_description']()}
                     onClick={() => void runAction('suspend')}
                   >
                     {m['code.actions.suspend']()}
@@ -1985,12 +2126,30 @@ function CodeWorkspacePage() {
                     variant="destructive"
                     className="h-7 rounded-full text-xs"
                     disabled={controlsDisabled}
-                    onClick={() => void endCurrentSession()}
+                    title={m['code.actions.end_description']()}
+                    onClick={() => setConfirmEndSessionOpen(true)}
                   >
                     <Square className="size-3" />
                     {m['code.actions.end']()}
                   </Button>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    className="h-7 rounded-full text-xs"
+                    disabled={controlsDisabled || !currentSession}
+                    title={m['code.actions.delete_permanently_description']()}
+                    onClick={() =>
+                      currentSession &&
+                      requestPermanentDeleteSession(currentSession)
+                    }
+                  >
+                    <Trash2 className="size-3" />
+                    {m['code.actions.delete_permanently']()}
+                  </Button>
                 </div>
+                <p className="text-muted-foreground mt-3 text-xs leading-5">
+                  {m['code.actions.storage_help']()}
+                </p>
                 <p className="text-muted-foreground mt-3 min-h-4 font-mono text-xs">
                   {actionMsg}
                 </p>
@@ -2002,7 +2161,10 @@ function CodeWorkspacePage() {
 
       <Dialog
         open={confirmNewSessionOpen}
-        onOpenChange={setConfirmNewSessionOpen}
+        onOpenChange={(open) => {
+          setConfirmNewSessionOpen(open);
+          if (!open) setDiscardConfirmation('');
+        }}
       >
         <DialogContent>
           <DialogHeader>
@@ -2023,6 +2185,26 @@ function CodeWorkspacePage() {
                 {m['code.sessions.new_confirm_discard_title']()}
               </p>
               <p>{m['code.sessions.new_confirm_discard_description']()}</p>
+              {currentSession && (
+                <div className="mt-3 space-y-2">
+                  <Label htmlFor="discard-session-confirmation">
+                    {m['code.actions.delete_permanently_confirmation_label']()}
+                  </Label>
+                  <p className="font-mono text-xs break-all">
+                    {currentSession.id}
+                  </p>
+                  <Input
+                    id="discard-session-confirmation"
+                    autoComplete="off"
+                    value={discardConfirmation}
+                    placeholder={currentSession.id}
+                    disabled={Boolean(busyAction)}
+                    onChange={(event) =>
+                      setDiscardConfirmation(event.target.value)
+                    }
+                  />
+                </div>
+              )}
             </div>
           </div>
           <DialogFooter className="gap-2 sm:justify-end">
@@ -2036,8 +2218,15 @@ function CodeWorkspacePage() {
             <Button
               type="button"
               variant="destructive"
+              disabled={
+                !currentSession ||
+                discardConfirmation !== currentSession.id ||
+                Boolean(busyAction) ||
+                fileTransferBusy
+              }
               onClick={() => {
                 setConfirmNewSessionOpen(false);
+                setDiscardConfirmation('');
                 void newSession('discard');
               }}
             >
@@ -2045,6 +2234,7 @@ function CodeWorkspacePage() {
             </Button>
             <Button
               type="button"
+              disabled={Boolean(busyAction) || fileTransferBusy}
               onClick={() => {
                 setConfirmNewSessionOpen(false);
                 void newSession('suspend');
@@ -2086,6 +2276,9 @@ function CodeWorkspacePage() {
             </Button>
             <Button
               type="button"
+              disabled={
+                Boolean(busyAction) || restoreInProgress || fileTransferBusy
+              }
               onClick={() => {
                 const session = confirmRestoreSession;
                 setConfirmRestoreSession(null);
@@ -2097,14 +2290,144 @@ function CodeWorkspacePage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog
+        open={confirmEndSessionOpen}
+        onOpenChange={(open) => {
+          if (!open && !busyAction) setConfirmEndSessionOpen(false);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{m['code.actions.end_confirm_title']()}</DialogTitle>
+            <DialogDescription>
+              {m['code.actions.end_confirm_description']()}
+            </DialogDescription>
+          </DialogHeader>
+          {currentSession && (
+            <p className="text-muted-foreground rounded-md border px-3 py-2 font-mono text-xs">
+              {currentSession.id}
+            </p>
+          )}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={Boolean(busyAction)}
+              onClick={() => setConfirmEndSessionOpen(false)}
+            >
+              {m['code.actions.confirm_cancel']()}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={
+                Boolean(busyAction) || !currentSession || fileTransferBusy
+              }
+              onClick={() => {
+                setConfirmEndSessionOpen(false);
+                void endCurrentSession();
+              }}
+            >
+              {m['code.actions.end_confirm_confirm']()}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(confirmPermanentDeleteSession)}
+        onOpenChange={(open) => {
+          if (!open && !busyAction) {
+            setConfirmPermanentDeleteSession(null);
+            setPermanentDeleteConfirmation('');
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {m['code.actions.delete_permanently_confirm_title']()}
+            </DialogTitle>
+            <DialogDescription>
+              {m['code.actions.delete_permanently_confirm_description']()}
+            </DialogDescription>
+          </DialogHeader>
+          {confirmPermanentDeleteSession && (
+            <div className="space-y-4">
+              <div className="border-destructive/40 bg-destructive/5 text-destructive rounded-md border px-3 py-3 text-sm leading-5">
+                <div className="flex items-start gap-2 font-medium">
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                  <span>{m['code.actions.delete_permanently_warning']()}</span>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="permanent-delete-session-confirmation">
+                  {m['code.actions.delete_permanently_confirmation_label']()}
+                </Label>
+                <p className="text-muted-foreground font-mono text-xs break-all">
+                  {confirmPermanentDeleteSession.id}
+                </p>
+                <Input
+                  id="permanent-delete-session-confirmation"
+                  autoComplete="off"
+                  value={permanentDeleteConfirmation}
+                  placeholder={confirmPermanentDeleteSession.id}
+                  disabled={busyAction === 'delete-permanently'}
+                  onChange={(event) =>
+                    setPermanentDeleteConfirmation(event.target.value)
+                  }
+                />
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={busyAction === 'delete-permanently'}
+              onClick={() => {
+                setConfirmPermanentDeleteSession(null);
+                setPermanentDeleteConfirmation('');
+              }}
+            >
+              {m['code.actions.confirm_cancel']()}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={
+                !confirmPermanentDeleteSession ||
+                permanentDeleteConfirmation !==
+                  confirmPermanentDeleteSession.id ||
+                Boolean(busyAction) ||
+                fileTransferBusy
+              }
+              onClick={() => {
+                const session = confirmPermanentDeleteSession;
+                if (session) void permanentlyDeleteSession(session);
+              }}
+            >
+              <Trash2 className="size-4" />
+              {busyAction === 'delete-permanently'
+                ? m['code.actions.running']()
+                : m['code.actions.delete_permanently_confirm_confirm']()}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
-async function runSessionAction(sessionId: string, action: CodeAction) {
+async function runSessionAction(
+  sessionId: string,
+  action: CodeAction,
+  input?: { confirmSessionId?: string }
+) {
   return apiPost<CodeActionResponse>(
     `/api/code/sessions/${encodeURIComponent(sessionId)}/actions`,
-    { action }
+    { action, ...input }
   );
 }
 
@@ -2120,8 +2443,9 @@ function upsertArchivedSession(
 ) {
   const rest = sessions.filter((item) => item.id !== session.id);
   if (
-    (session.status !== 'ended' && session.status !== 'suspended') ||
-    !session.archiveKey
+    !session.deletionPending &&
+    ((session.status !== 'ended' && session.status !== 'suspended') ||
+      !session.archiveKey)
   ) {
     return rest;
   }

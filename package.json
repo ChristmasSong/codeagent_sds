@@ -17,7 +17,7 @@
     "runtime:deploy": "pnpm --dir packages/runtime run deploy",
     "runtime:deploy:worker": "pnpm --dir packages/runtime run deploy:worker",
     "runtime:smoke": "pnpm --dir packages/runtime run smoke",
-    "test:code-runtime": "node --import tsx src/modules/code/runtime.test.ts && pnpm --dir packages/runtime run check",
+    "test:code-runtime": "node --import tsx src/modules/code/runtime.test.ts && node --import tsx src/lib/code-files.download.test.ts && pnpm --dir packages/runtime run check",
     "test:billing": "node --import tsx src/modules/code/billing.test.ts && node --import tsx packages/runtime/src/token-usage.test.ts && node --import tsx packages/runtime/src/provider-usage.test.ts && node --import tsx packages/runtime/src/billing-outbox.test.ts && node --import tsx src/modules/payment/topup-catalog.test.ts && node --import tsx src/core/payment/stripe.test.ts",
     "postinstall": "mkdir -p data && (test -f src/config/db/schema.ts || node scripts/db-setup.mjs)",
     "db:setup": "node scripts/db-setup.mjs",

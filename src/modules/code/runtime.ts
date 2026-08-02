@@ -109,19 +109,11 @@ export function actionUrl(
   return appendSessionParams(parts.join('/'), agent, model);
 }
 
-export function previewUrl(
-  base: string,
-  userId: string,
-  sessionId: string
-): string {
-  return `${trimSlashes(base)}/preview/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}/`;
-}
-
 export function workspaceFilesUrl(
   base: string,
   userId: string,
   sessionId: string,
-  operation?: 'status' | 'content'
+  operation?: 'status' | 'content' | 'upload' | 'download-all'
 ): string {
   const suffix = operation ? `/${operation}` : '';
   return `${trimSlashes(base)}/files/${encodeURIComponent(userId)}/${encodeURIComponent(sessionId)}${suffix}`;

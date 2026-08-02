@@ -729,6 +729,10 @@ export const codeSession = table(
     title: text('title').notNull().default(''),
     archiveKey: text('archive_key'),
     archiveDigest: text('archive_digest'),
+    archiveLockToken: text('archive_lock_token').notNull().default(''),
+    archiveLockExpiresAt: integer('archive_lock_expires_at', {
+      mode: 'timestamp',
+    }),
     suspensionReason: text('suspension_reason').notNull().default(''),
     lastBilledAt: integer('last_billed_at', { mode: 'timestamp' }),
     billedCredits: integer('billed_credits').notNull().default(0),
@@ -747,6 +751,7 @@ export const codeSession = table(
   (t) => [
     index('idx_code_session_user_status').on(t.userId, t.status),
     index('idx_code_session_user_last_active').on(t.userId, t.lastActiveAt),
+    index('idx_code_session_archive_lock').on(t.archiveLockExpiresAt),
   ]
 );
 
@@ -846,6 +851,156 @@ export const codeBillingEvent = table(
   ]
 );
 
+export const storageUsage = table(
+  'code_storage_usage',
+  {
+    userId: text('user_id')
+      .primaryKey()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    usedBytes: integer('used_bytes').notNull().default(0),
+    reservedBytes: integer('reserved_bytes').notNull().default(0),
+    pendingDeleteBytes: integer('pending_delete_bytes').notNull().default(0),
+    quotaOverrideBytes: integer('quota_override_bytes'),
+    reconciledAt: integer('reconciled_at', { mode: 'timestamp' }),
+    reconcileLockToken: text('reconcile_lock_token').notNull().default(''),
+    reconcileLockExpiresAt: integer('reconcile_lock_expires_at', {
+      mode: 'timestamp',
+    }),
+    version: integer('version').notNull().default(0),
+    createdAt: integer('created_at', { mode: 'timestamp' })
+      .notNull()
+      .$defaultFn(() => new Date()),
+    updatedAt: integer('updated_at', { mode: 'timestamp' })
+      .notNull()
+      .$defaultFn(() => new Date())
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    index('idx_code_storage_usage_used').on(t.usedBytes),
+    index('idx_code_storage_usage_updated').on(t.updatedAt),
+    index('idx_code_storage_usage_reconcile').on(t.reconciledAt),
+  ]
+);
+
+export const storagePlatformUsage = table('code_storage_platform_usage', {
+  id: text('id').primaryKey(),
+  usedBytes: integer('used_bytes').notNull().default(0),
+  reservedBytes: integer('reserved_bytes').notNull().default(0),
+  pendingDeleteBytes: integer('pending_delete_bytes').notNull().default(0),
+  observedBytes: integer('observed_bytes').notNull().default(0),
+  observedObjects: integer('observed_objects').notNull().default(0),
+  observedAt: integer('observed_at', { mode: 'timestamp' }),
+  version: integer('version').notNull().default(0),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .$defaultFn(() => new Date())
+    .$onUpdate(() => new Date()),
+});
+
+export const storageReservation = table(
+  'code_storage_reservation',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    sessionId: text('session_id').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    requestedBytes: integer('requested_bytes').notNull(),
+    replaceableBytes: integer('replaceable_bytes').notNull().default(0),
+    reservedBytes: integer('reserved_bytes').notNull().default(0),
+    actualBytes: integer('actual_bytes').notNull().default(0),
+    replaceObjectId: text('replace_object_id'),
+    objectKey: text('object_key'),
+    status: text('status').notNull().default('reserved'),
+    expiresAt: integer('expires_at', { mode: 'timestamp' }).notNull(),
+    settledAt: integer('settled_at', { mode: 'timestamp' }),
+    releasedAt: integer('released_at', { mode: 'timestamp' }),
+    createdAt: integer('created_at', { mode: 'timestamp' })
+      .notNull()
+      .$defaultFn(() => new Date()),
+    updatedAt: integer('updated_at', { mode: 'timestamp' })
+      .notNull()
+      .$defaultFn(() => new Date())
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    uniqueIndex('idx_code_storage_reservation_idempotency').on(
+      t.idempotencyKey
+    ),
+    index('idx_code_storage_reservation_user_status').on(t.userId, t.status),
+    index('idx_code_storage_reservation_expires').on(t.status, t.expiresAt),
+  ]
+);
+
+export const storageObject = table(
+  'code_storage_object',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    sessionId: text('session_id').notNull(),
+    key: text('key').notNull(),
+    kind: text('kind').notNull().default('current'),
+    status: text('status').notNull().default('pending'),
+    sizeBytes: integer('size_bytes').notNull().default(0),
+    digest: text('digest'),
+    reservationId: text('reservation_id').references(
+      () => storageReservation.id,
+      { onDelete: 'set null' }
+    ),
+    expiresAt: integer('expires_at', { mode: 'timestamp' }),
+    deletedAt: integer('deleted_at', { mode: 'timestamp' }),
+    createdAt: integer('created_at', { mode: 'timestamp' })
+      .notNull()
+      .$defaultFn(() => new Date()),
+    updatedAt: integer('updated_at', { mode: 'timestamp' })
+      .notNull()
+      .$defaultFn(() => new Date())
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    uniqueIndex('idx_code_storage_object_key').on(t.key),
+    uniqueIndex('idx_code_storage_object_reservation').on(t.reservationId),
+    index('idx_code_storage_object_user_status').on(t.userId, t.status),
+    index('idx_code_storage_object_session_status').on(t.sessionId, t.status),
+    index('idx_code_storage_object_expiry').on(t.status, t.expiresAt),
+  ]
+);
+
+export const storageDailyMetric = table(
+  'code_storage_daily_metric',
+  {
+    id: text('id').primaryKey(),
+    metricDate: text('metric_date').notNull(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    storedBytes: integer('stored_bytes').notNull().default(0),
+    uploadedBytes: integer('uploaded_bytes').notNull().default(0),
+    deletedBytes: integer('deleted_bytes').notNull().default(0),
+    archiveCount: integer('archive_count').notNull().default(0),
+    deleteCount: integer('delete_count').notNull().default(0),
+    classAOperations: integer('class_a_operations').notNull().default(0),
+    classBOperations: integer('class_b_operations').notNull().default(0),
+    createdAt: integer('created_at', { mode: 'timestamp' })
+      .notNull()
+      .$defaultFn(() => new Date()),
+    updatedAt: integer('updated_at', { mode: 'timestamp' })
+      .notNull()
+      .$defaultFn(() => new Date())
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    uniqueIndex('idx_code_storage_daily_metric_user_date').on(
+      t.userId,
+      t.metricDate
+    ),
+    index('idx_code_storage_daily_metric_date').on(t.metricDate),
+  ]
+);
+
 // ─── Invite Codes ────────────────────────────────────────────────────────────
 
 export const inviteCode = table(
@@ -893,6 +1048,16 @@ export type CodeModel = typeof codeModel.$inferSelect;
 export type NewCodeModel = typeof codeModel.$inferInsert;
 export type CodeBillingEvent = typeof codeBillingEvent.$inferSelect;
 export type NewCodeBillingEvent = typeof codeBillingEvent.$inferInsert;
+export type StorageUsage = typeof storageUsage.$inferSelect;
+export type NewStorageUsage = typeof storageUsage.$inferInsert;
+export type StoragePlatformUsage = typeof storagePlatformUsage.$inferSelect;
+export type NewStoragePlatformUsage = typeof storagePlatformUsage.$inferInsert;
+export type StorageObject = typeof storageObject.$inferSelect;
+export type NewStorageObject = typeof storageObject.$inferInsert;
+export type StorageReservation = typeof storageReservation.$inferSelect;
+export type NewStorageReservation = typeof storageReservation.$inferInsert;
+export type StorageDailyMetric = typeof storageDailyMetric.$inferSelect;
+export type NewStorageDailyMetric = typeof storageDailyMetric.$inferInsert;
 export type InviteCode = typeof inviteCode.$inferSelect;
 export type NewInviteCode = typeof inviteCode.$inferInsert;
 export type UserInvite = typeof userInvite.$inferSelect;
