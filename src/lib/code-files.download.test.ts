@@ -213,3 +213,53 @@ function status(
   );
   assert.equal(cancellationAttempted, true);
 }
+
+{
+  let now = 0;
+  let cancellationAttempts = 0;
+  await assert.rejects(
+    waitForWorkspaceDownloadCompletion({
+      readStatus: async (cancel) => {
+        if (cancel) cancellationAttempts += 1;
+        throw new Error('status unavailable');
+      },
+      now: () => now,
+      sleep: async (delayMs) => {
+        now += delayMs;
+      },
+      timeoutMs: 1_500,
+      cancelMaxAttempts: 2,
+    }),
+    /workspace_download_status_timeout/
+  );
+  assert.equal(
+    cancellationAttempts,
+    2,
+    'an unavailable cancellation endpoint must have a bounded retry count'
+  );
+}
+
+{
+  let now = 0;
+  let cancellationAttempts = 0;
+  await assert.rejects(
+    waitForWorkspaceDownloadCompletion({
+      readStatus: async (cancel) => {
+        if (cancel) cancellationAttempts += 1;
+        return status('streaming', true);
+      },
+      now: () => now,
+      sleep: async (delayMs) => {
+        now += delayMs;
+      },
+      timeoutMs: 500,
+      cancelMaxAttempts: 2,
+    }),
+    /workspace_download_status_timeout/
+  );
+  assert.equal(
+    cancellationAttempts,
+    2,
+    'a cancellation that remains busy must not keep the mutation pending'
+  );
+}

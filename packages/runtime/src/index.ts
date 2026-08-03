@@ -711,16 +711,22 @@ function archiveListLimit(url: URL): number {
   return Math.min(archiveManagementPageSize, Math.max(1, parsed));
 }
 
-function archiveMaxBytes(url: URL, env: Env): number | null {
-  const value = url.searchParams.get('maxBytes');
+function archiveLimitBytes(
+  url: URL,
+  env: Env,
+  parameter: 'maxBytes' | 'maxWorkspaceBytes'
+): number | null {
+  const value = url.searchParams.get(parameter);
   if (value === null) return null;
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 0) {
     throw new RuntimeOperationError(
       400,
-      'invalid_archive_max_bytes',
+      parameter === 'maxBytes'
+        ? 'invalid_archive_max_bytes'
+        : 'invalid_archive_workspace_max_bytes',
       'archive.quota',
-      'maxBytes must be a non-negative safe integer'
+      `${parameter} must be a non-negative safe integer`
     );
   }
   const configuredHardLimit = Number(env.WORKSPACE_ARCHIVE_HARD_LIMIT_BYTES);
@@ -729,6 +735,18 @@ function archiveMaxBytes(url: URL, env: Env): number | null {
       ? configuredHardLimit
       : 2 * 1024 ** 3;
   return Math.min(parsed, hardLimit);
+}
+
+function archiveMaxBytes(url: URL, env: Env): number | null {
+  return archiveLimitBytes(url, env, 'maxBytes');
+}
+
+function archiveWorkspaceMaxBytes(
+  url: URL,
+  env: Env,
+  archiveBytes: number
+): number {
+  return archiveLimitBytes(url, env, 'maxWorkspaceBytes') ?? archiveBytes;
 }
 
 function archiveRetentionDays(url: URL): number {
@@ -1196,6 +1214,7 @@ async function archive(
   targetArchiveKey = '',
   retainPrevious = true,
   maxBytes: number | null = null,
+  maxWorkspaceBytes: number | null = null,
   retentionDays = 7,
   maxSnapshots = 2,
   deferCleanup = false
@@ -1215,6 +1234,9 @@ async function archive(
   target.pathname = `/archive/${encodeURIComponent(sessionId)}`;
   if (maxBytes !== null) {
     target.searchParams.set('maxBytes', String(maxBytes));
+  }
+  if (maxWorkspaceBytes !== null) {
+    target.searchParams.set('maxWorkspaceBytes', String(maxWorkspaceBytes));
   }
   const response = await container(env, userId).fetch(new Request(target));
   if (!response.ok) {
@@ -2417,6 +2439,11 @@ export default {
               'maxBytes is required for workspace archives'
             );
           }
+          const maxWorkspaceBytes = archiveWorkspaceMaxBytes(
+            url,
+            env,
+            maxBytes
+          );
           return await archive(
             env,
             url.origin,
@@ -2426,6 +2453,7 @@ export default {
             requestedTargetArchiveKey(request),
             url.searchParams.get('retainPrevious') !== '0',
             maxBytes,
+            maxWorkspaceBytes,
             archiveRetentionDays(url),
             archiveMaxSnapshots(url),
             url.searchParams.get('deferCleanup') === '1'

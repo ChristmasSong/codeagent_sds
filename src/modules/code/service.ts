@@ -878,6 +878,7 @@ interface RuntimeJsonOptions {
   targetArchiveKey?: string;
   retainPrevious?: boolean;
   maxBytes?: number;
+  maxWorkspaceBytes?: number;
   retentionDays?: number;
   maxSnapshots?: number;
   deferCleanup?: boolean;
@@ -927,6 +928,12 @@ async function runtimeJson(
   }
   if (options.maxBytes !== undefined) {
     url.searchParams.set('maxBytes', String(options.maxBytes));
+  }
+  if (options.maxWorkspaceBytes !== undefined) {
+    url.searchParams.set(
+      'maxWorkspaceBytes',
+      String(options.maxWorkspaceBytes)
+    );
   }
   if (options.retentionDays !== undefined) {
     url.searchParams.set('retentionDays', String(options.retentionDays));
@@ -1312,6 +1319,7 @@ async function archiveRuntimeWithQuotaLocked(
           targetArchiveKey: targetKey,
           retainPrevious,
           maxBytes: requestedBytes,
+          maxWorkspaceBytes: storageSettings.workspaceQuotaBytes,
           retentionDays: storageSettings.retentionDays,
           maxSnapshots: storageSettings.maxSnapshotsPerSession,
           deferCleanup: true,

@@ -134,6 +134,16 @@ globalThis.fetch = async (input, init) => {
   if (request.action === 'archive') {
     assert.equal(request.method, 'POST');
     assert.equal(request.url.searchParams.get('deferCleanup'), '1');
+    assert.equal(
+      request.url.searchParams.get('maxWorkspaceBytes'),
+      String(2 * 1024 ** 3),
+      'the Runtime must receive the uncompressed workspace limit separately'
+    );
+    assert.equal(
+      request.url.searchParams.get('maxBytes'),
+      String(4096 + 1024 * 1024),
+      'the Runtime archive limit must match the reserved R2 bytes'
+    );
     newKey = request.headers.get('x-hicode-target-archive-key') || '';
     assert.match(newKey, /\/archives\/[^/]+\.tar\.gz$/);
     physicalKeys.add(newKey);

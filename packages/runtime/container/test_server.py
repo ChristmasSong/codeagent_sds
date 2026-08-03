@@ -136,9 +136,13 @@ class WorkspaceArchiveTests(unittest.TestCase):
                 if member.isfile()
             }
 
-    def build_archive(self, max_bytes=None):
+    def build_archive(self, max_bytes=None, max_workspace_bytes=None):
         archive_file, manifest, archive_sha256, archive_size = (
-            server.make_archive(self.session_id, max_bytes)
+            server.make_archive(
+                self.session_id,
+                max_bytes,
+                max_workspace_bytes,
+            )
         )
         try:
             data = archive_file.read()
@@ -237,6 +241,21 @@ class WorkspaceArchiveTests(unittest.TestCase):
         self.assertEqual(raised.exception.details["maxBytes"], 1024)
         self.assertEqual(raised.exception.details["actualBytes"], 1025)
 
+    def test_archive_uses_separate_workspace_and_object_limits(self):
+        self.write("compressible.bin", b"x" * 2048)
+
+        data, manifest = self.build_archive(
+            max_bytes=1024,
+            max_workspace_bytes=2048,
+        )
+
+        self.assertLessEqual(len(data), 1024)
+        self.assertEqual(manifest["total_bytes"], 2048)
+        self.assertEqual(
+            self.archive_entries(data)["compressible.bin"],
+            b"x" * 2048,
+        )
+
     def test_archive_query_max_bytes_validation(self):
         self.assertEqual(
             server.archive_max_bytes(
@@ -246,6 +265,22 @@ class WorkspaceArchiveTests(unittest.TestCase):
         )
         self.assertIsNone(
             server.archive_max_bytes(urlparse("/archive/session-test"))
+        )
+        self.assertEqual(
+            server.archive_workspace_max_bytes(
+                urlparse(
+                    "/archive/session-test?maxBytes=123&maxWorkspaceBytes=456"
+                ),
+                123,
+            ),
+            456,
+        )
+        self.assertEqual(
+            server.archive_workspace_max_bytes(
+                urlparse("/archive/session-test?maxBytes=123"),
+                123,
+            ),
+            123,
         )
         for value in ["", "-1", "1.5", "9007199254740992"]:
             with self.subTest(value=value):
@@ -261,6 +296,21 @@ class WorkspaceArchiveTests(unittest.TestCase):
                 self.assertEqual(
                     raised.exception.code,
                     "invalid_archive_max_bytes",
+                )
+                with self.assertRaises(
+                    server.RuntimeOperationError
+                ) as workspace_raised:
+                    server.archive_workspace_max_bytes(
+                        urlparse(
+                            "/archive/session-test"
+                            f"?maxWorkspaceBytes={value}"
+                        ),
+                        123,
+                    )
+                self.assertEqual(workspace_raised.exception.status, 400)
+                self.assertEqual(
+                    workspace_raised.exception.code,
+                    "invalid_archive_workspace_max_bytes",
                 )
 
     def test_archive_route_enforces_query_quota_before_file_reads(self):
@@ -282,6 +332,25 @@ class WorkspaceArchiveTests(unittest.TestCase):
         self.assertEqual(handler.status, 413)
         self.assertEqual(payload["code"], "archive_size_exceeded")
         self.assertEqual(payload["stage"], "archive.quota")
+
+    def test_archive_route_separates_workspace_and_object_limits(self):
+        self.write("compressible.bin", b"x" * 2048)
+        handler = RecordingHandler()
+        handler.path = (
+            f"/archive/{self.session_id}"
+            "?maxBytes=1024&maxWorkspaceBytes=2048"
+        )
+        handler.headers = {}
+
+        server.Handler.do_GET(handler)
+
+        data = handler.wfile.getvalue()
+        self.assertEqual(handler.status, 200)
+        self.assertLessEqual(len(data), 1024)
+        self.assertEqual(
+            self.archive_entries(data)["compressible.bin"],
+            b"x" * 2048,
+        )
 
     def test_archive_route_streams_compatible_gzip_response(self):
         self.write("README.md", b"stream me\n")

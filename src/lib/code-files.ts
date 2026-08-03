@@ -28,6 +28,7 @@ export interface WorkspaceStatusResult {
 export const SANDBOX_DOWNLOAD_MUTATION_KEY = ['sandbox-download-all'] as const;
 export const SANDBOX_DOWNLOAD_START_TIMEOUT_MS = 30_000;
 export const SANDBOX_DOWNLOAD_STATUS_TIMEOUT_MS = 31 * 60_000;
+export const SANDBOX_DOWNLOAD_CANCEL_MAX_ATTEMPTS = 3;
 
 export type WorkspaceTransferState =
   | 'not_started'
@@ -49,6 +50,7 @@ interface WorkspaceDownloadWaitOptions {
   sleep?: (delayMs: number) => Promise<void>;
   startTimeoutMs?: number;
   timeoutMs?: number;
+  cancelMaxAttempts?: number;
 }
 
 function workspaceDownloadPollInterval(
@@ -79,11 +81,16 @@ export async function waitForWorkspaceDownloadCompletion({
   sleep: wait = sleep,
   startTimeoutMs = SANDBOX_DOWNLOAD_START_TIMEOUT_MS,
   timeoutMs = SANDBOX_DOWNLOAD_STATUS_TIMEOUT_MS,
+  cancelMaxAttempts = SANDBOX_DOWNLOAD_CANCEL_MAX_ATTEMPTS,
 }: WorkspaceDownloadWaitOptions): Promise<void> {
   const startedAt = now();
+  const boundedCancelMaxAttempts = Number.isFinite(cancelMaxAttempts)
+    ? Math.max(1, Math.floor(cancelMaxAttempts))
+    : SANDBOX_DOWNLOAD_CANCEL_MAX_ATTEMPTS;
   let lastState: WorkspaceTransferState = 'not_started';
   let statusErrorCount = 0;
   let cancellationError = '';
+  let cancellationAttempts = 0;
 
   while (true) {
     const elapsedMs = now() - startedAt;
@@ -91,13 +98,21 @@ export async function waitForWorkspaceDownloadCompletion({
       cancellationError = 'workspace_download_status_timeout';
     }
 
+    const cancelling = Boolean(cancellationError);
+    if (cancelling) cancellationAttempts += 1;
+
     let status: WorkspaceTransferStatusResult;
     try {
-      status = await readStatus(Boolean(cancellationError));
+      status = await readStatus(cancelling);
     } catch {
       // A temporary status failure must not release the lifecycle lock while
-      // the download may still be streaming.
+      // the download may still be streaming. Once cancellation starts, retry
+      // only a bounded number of times so a dead status endpoint cannot keep
+      // the mutation and all lifecycle controls pending forever.
       statusErrorCount += 1;
+      if (cancelling && cancellationAttempts >= boundedCancelMaxAttempts) {
+        throw new Error(cancellationError);
+      }
       await wait(workspaceDownloadErrorPollInterval(statusErrorCount));
       continue;
     }
@@ -115,6 +130,9 @@ export async function waitForWorkspaceDownloadCompletion({
     ) {
       cancellationError ||= 'workspace_download_not_started';
       continue;
+    }
+    if (cancelling && cancellationAttempts >= boundedCancelMaxAttempts) {
+      throw new Error(cancellationError);
     }
 
     await wait(workspaceDownloadPollInterval(lastState, elapsedMs));
