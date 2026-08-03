@@ -53,7 +53,7 @@ function positiveInteger(value: unknown, fallback: number): number {
 export function getCodeStorageSettings(
   configs: StorageConfigMap
 ): CodeStorageSettings {
-  const userQuotaGb = positiveNumber(configs.code_storage_user_quota_gb, 1);
+  const userQuotaGb = positiveNumber(configs.code_storage_user_quota_gb, 2);
   return {
     userQuotaBytes: Math.floor(userQuotaGb * GIB),
     workspaceQuotaBytes: Math.floor(

@@ -9,6 +9,7 @@ const provider = process.env.DATABASE_PROVIDER || 'sqlite';
 const dialectMap: Record<string, 'sqlite' | 'postgresql' | 'mysql' | 'turso'> =
   {
     sqlite: 'sqlite',
+    d1: 'sqlite',
     postgres: 'postgresql',
     postgresql: 'postgresql',
     mysql: 'mysql',

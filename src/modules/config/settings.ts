@@ -460,10 +460,10 @@ export function getSettings(): Setting[] {
       name: 'code_storage_user_quota_gb',
       title: 'Storage quota per user (GB)',
       type: 'number',
-      placeholder: '1',
+      placeholder: '2',
       group: 'usage_billing',
       tab: 'general',
-      defaultValue: '1',
+      defaultValue: '2',
     },
     {
       name: 'code_storage_workspace_quota_gb',

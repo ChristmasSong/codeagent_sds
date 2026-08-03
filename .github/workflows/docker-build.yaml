@@ -13,9 +13,45 @@ env:
   SVR_NAME: ${{ github.event.repository.name }}
 
 jobs:
+  verify-migrations:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify committed D1 migrations
+        env:
+          DATABASE_PROVIDER: d1
+        run: |
+          pnpm db:setup
+          pnpm db:generate
+          if [ -n "$(git status --porcelain --untracked-files=all -- drizzle)" ]; then
+            git status --short --untracked-files=all -- drizzle
+            echo "::error::Database schema changes require committed Drizzle migrations"
+            exit 1
+          fi
+
   build-and-push:
     # Fork PRs must never receive a package write token or publish an image.
     if: github.event_name == 'pull_request'
+    needs: verify-migrations
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -45,6 +81,7 @@ jobs:
 
   publish:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: verify-migrations
     runs-on: ubuntu-latest
     permissions:
       contents: read

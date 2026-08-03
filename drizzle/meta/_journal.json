@@ -85,6 +85,13 @@
       "when": 1784638571164,
       "tag": "0011_blushing_diamondback",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1785765559037,
+      "tag": "0012_material_lady_deathstrike",
+      "breakpoints": true
     }
   ]
 }

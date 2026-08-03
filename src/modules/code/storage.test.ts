@@ -28,7 +28,19 @@ assert.deepEqual(
 
 assert.equal(
   getCodeStorageSettings({ billing_storage_free_gb: '3' }).userQuotaBytes,
-  GIB
+  2 * GIB
+);
+assert.deepEqual(
+  getCodeStorageSettings({}),
+  {
+    userQuotaBytes: 2 * GIB,
+    workspaceQuotaBytes: 2 * GIB,
+    platformCapacityBytes: 1000 * GIB,
+    monthlyBudgetUsd: 100,
+    retentionDays: 7,
+    maxSnapshotsPerSession: 2,
+  },
+  'the default user archive quota must cover the default workspace limit'
 );
 
 assert.deepEqual(

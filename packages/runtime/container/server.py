@@ -2350,26 +2350,43 @@ def archive_path_is_excluded(relative: PurePosixPath) -> bool:
     return any(parts[: len(prefix)] == prefix for prefix in ARCHIVE_EXCLUDED_PATHS)
 
 
-def archive_max_bytes(parsed):
-    values = parse_qs(parsed.query, keep_blank_values=True).get("maxBytes")
+def archive_limit_bytes(parsed, parameter: str, error_code: str):
+    values = parse_qs(parsed.query, keep_blank_values=True).get(parameter)
     if values is None:
         return None
     if len(values) != 1 or not values[0].isdigit():
         raise RuntimeOperationError(
-            "invalid_archive_max_bytes",
+            error_code,
             "archive.quota",
-            "maxBytes must be a non-negative safe integer",
+            f"{parameter} must be a non-negative safe integer",
             400,
         )
     value = int(values[0])
     if value > MAX_SAFE_INTEGER:
         raise RuntimeOperationError(
-            "invalid_archive_max_bytes",
+            error_code,
             "archive.quota",
-            "maxBytes must be a non-negative safe integer",
+            f"{parameter} must be a non-negative safe integer",
             400,
         )
     return value
+
+
+def archive_max_bytes(parsed):
+    return archive_limit_bytes(
+        parsed,
+        "maxBytes",
+        "invalid_archive_max_bytes",
+    )
+
+
+def archive_workspace_max_bytes(parsed, archive_bytes: Optional[int] = None):
+    workspace_bytes = archive_limit_bytes(
+        parsed,
+        "maxWorkspaceBytes",
+        "invalid_archive_workspace_max_bytes",
+    )
+    return archive_bytes if workspace_bytes is None else workspace_bytes
 
 
 def archive_size_exceeded(max_bytes: int, actual_bytes: int, path: str = ""):
@@ -2692,7 +2709,11 @@ def open_restore_archive(source):
     yield source
 
 
-def make_archive(session_id: str, max_bytes: Optional[int] = None):
+def make_archive(
+    session_id: str,
+    max_bytes: Optional[int] = None,
+    max_workspace_bytes: Optional[int] = None,
+):
     root = session_path(session_id)
     if not root.exists():
         raise RuntimeOperationError(
@@ -2704,7 +2725,7 @@ def make_archive(session_id: str, max_bytes: Optional[int] = None):
     entries, skipped = snapshot_workspace(
         root,
         "archive.snapshot",
-        max_bytes,
+        max_bytes if max_workspace_bytes is None else max_workspace_bytes,
     )
     files = []
     archive_file = tempfile.TemporaryFile(mode="w+b")
@@ -3029,8 +3050,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 2 and parts[0] == "archive":
                 with workspace_file_transfer(parts[1], "archive.lock"):
                     max_bytes = archive_max_bytes(parsed)
+                    max_workspace_bytes = archive_workspace_max_bytes(
+                        parsed, max_bytes
+                    )
                     archive_file, manifest, archive_sha256, archive_size = (
-                        make_archive(parts[1], max_bytes)
+                        make_archive(
+                            parts[1],
+                            max_bytes,
+                            max_workspace_bytes,
+                        )
                     )
                     try:
                         self.send_response(200)
